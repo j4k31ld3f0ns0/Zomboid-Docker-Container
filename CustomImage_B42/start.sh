@@ -73,6 +73,10 @@ done
 
 # 5. Configure JVM Memory & Extra Args via ProjectZomboid64.json
 JVM_CONFIG_FILE="$INSTALL_DIR/ProjectZomboid64.json"
+# Records the exact args injected on the previous boot so they can be removed
+# before re-injecting. ./server_files is a persisted bind mount, so without this
+# PZ_JVM_EXTRA_ARGS accumulates duplicates and args dropped from compose linger.
+MANAGED_ARGS_FILE="$INSTALL_DIR/.pz_managed_vmargs.json"
 PZ_JVM_MEMORY="${PZ_JVM_MEMORY:-4g}"
 
 if [ -f "$JVM_CONFIG_FILE" ]; then
@@ -84,12 +88,37 @@ if [ -f "$JVM_CONFIG_FILE" ]; then
         extra_args_json=$(printf '%s\n' $PZ_JVM_EXTRA_ARGS | jq -R . | jq -s .)
     fi
 
+    prev_managed_json="[]"
+    if [ -f "$MANAGED_ARGS_FILE" ] && jq -e . "$MANAGED_ARGS_FILE" >/dev/null 2>&1; then
+        prev_managed_json=$(cat "$MANAGED_ARGS_FILE")
+    fi
+
+    # -Xmx/-Xms are stripped by prefix; everything else we added is stripped by
+    # exact match against $prev. The "map(. as $a | ...)" binding is required -
+    # inside the pipe of index(), "." would refer to $prev, not the element.
+    # The closing reduce is an order-preserving dedupe: it collapses duplicates
+    # left by a missing/corrupt marker, and cleans up installs that already
+    # accumulated them before this logic existed. Exact-duplicate JVM args are
+    # always redundant, and keeping the first occurrence preserves stock order.
     tmp_file=$(mktemp)
-    jq --arg mem "$PZ_JVM_MEMORY" --argjson extra "$extra_args_json" '
-        .vmArgs = ((.vmArgs // []) | map(select((startswith("-Xmx") or startswith("-Xms")) | not)))
+    if jq --arg mem "$PZ_JVM_MEMORY" \
+          --argjson extra "$extra_args_json" \
+          --argjson prev "$prev_managed_json" '
+        .vmArgs = ((.vmArgs // [])
+                    | map(select((startswith("-Xmx") or startswith("-Xms")) | not))
+                    | map(. as $a | select(($prev | index($a)) == null)))
                   + ["-Xmx\($mem)", "-Xms\($mem)"]
                   + $extra
-    ' "$JVM_CONFIG_FILE" > "$tmp_file" && mv "$tmp_file" "$JVM_CONFIG_FILE"
+        | .vmArgs |= reduce .[] as $a ([]; if index($a) == null then . + [$a] else . end)
+    ' "$JVM_CONFIG_FILE" > "$tmp_file"; then
+        mv "$tmp_file" "$JVM_CONFIG_FILE"
+        # Written only after the rewrite lands, so the marker never claims to
+        # describe args that aren't actually in the file.
+        printf '%s' "$extra_args_json" > "$MANAGED_ARGS_FILE"
+    else
+        echo "WARNING: Failed to rewrite $JVM_CONFIG_FILE; leaving it unchanged."
+        rm -f "$tmp_file"
+    fi
 else
     echo "WARNING: $JVM_CONFIG_FILE not found; skipping JVM memory/args injection."
 fi

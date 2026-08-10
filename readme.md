@@ -55,6 +55,17 @@ Server settings can be managed directly through `docker-compose.yml` environment
 | `SERVER_NAME` | Name of the save file and config entry | `servertest` |
 | `ADMIN_PASSWORD` | Password for the default admin account | `ChangeThis...` |
 | `PZ_JVM_MEMORY` | Java Heap Size allocation (e.g., `4g`, `8g`) | `4g` |
+| `PZ_JVM_EXTRA_ARGS` | Space-separated extra JVM flags (e.g., `-Duser.language=en`) | *(none)* |
+
+> **Note on JVM settings:** Project Zomboid itself does not read these variables. On every boot,
+> `start.sh` rewrites the `vmArgs` array in `server_files/ProjectZomboid64.json` to match them.
+> This runs *after* SteamCMD, because `app_update ... validate` restores any game file that
+> differs from Steam's manifest — so hand-editing that JSON is not durable.
+>
+> Both variables are declarative: the injected args are tracked in
+> `server_files/.pz_managed_vmargs.json`, so changing a value replaces it and removing a flag
+> from `docker-compose.yml` actually removes it on the next restart, rather than leaving the old
+> entry behind on the persisted volume.
 
 ### Game Settings (`CFG_` Injection)
 Any environment variable prefixed with `CFG_` is automatically stripped and appended to `servertest.ini` on startup.
@@ -131,6 +142,46 @@ rather than silently skipping the update.
 ```bash
 docker logs -f pz-mod-watcher
 ```
+
+### Verifying the Watcher (`probe.py`)
+
+The watcher spends most of its life doing nothing, so a broken assumption can sit
+unnoticed until the day it actually needs to restart the server. `probe.py` checks
+those assumptions on demand:
+
+```bash
+docker compose exec mod-watcher python probe.py
+```
+
+It is strictly read-only — it authenticates over RCON and runs the `players`
+command, but never sends `save`, `quit`, or `servermsg`, and never writes the
+state file. It is safe to run on a populated server. Exit status is `0` when
+nothing failed.
+
+What it checks:
+
+* **RCON packet alignment.** `rcon_command()` reads exactly one packet per
+  request. Some RCON implementations send an empty packet before the auth
+  response; if this server does, every later read is off by one — command output
+  comes back empty and a wrong password is silently accepted.
+* **Player count parsing.** That the real `players` output matches
+  `PLAYER_COUNT_RE`. If it doesn't, `rcon_player_count()` returns `None`, which
+  the watcher treats as "occupied" — so it would never restart on an empty
+  server and would always wait out `MAX_RESTART_WAIT_SECONDS` instead.
+* **Steam API reachability**, plus any configured mod IDs Steam has no entry for
+  (delisted, private, or mistyped) — those are silently skipped by update checks.
+* **State file writability**, the usual cause being a root-owned
+  `./mod_watcher_state` mount versus the container's UID 1000.
+* **Pending restarts** — whether the recorded baseline already differs from
+  current Steam timestamps.
+
+Run it once with the server empty and once with someone connected; the zero-player
+and non-zero paths parse differently. Two optional flags:
+
+| Flag | Purpose |
+| :--- | :--- |
+| `--test-bad-password` | Also confirm a wrong password is rejected. Off by default, since some RCON implementations throttle or ban on failed auth. |
+| `--skip-steam` | RCON checks only; no outbound network. |
 
 ---
 
