@@ -1,0 +1,70 @@
+# Use a newer Debian base (Bookworm/12) for updated C++ libraries required by newer PZ builds
+FROM debian:bookworm-slim
+
+# Avoid prompts during package installation
+ENV DEBIAN_FRONTEND=noninteractive
+
+# 1. Enable non-free repositories & install dependencies
+# Debian 12 uses deb822 format, so we update debian.sources
+RUN sed -i 's/Components: main/Components: main contrib non-free non-free-firmware/g' /etc/apt/sources.list.d/debian.sources && \
+    dpkg --add-architecture i386 && \
+    apt-get update && \
+    apt-get install -y \
+    lib32gcc-s1 \
+    lib32stdc++6 \
+    curl \
+    wget \
+    ca-certificates \
+    locales \
+    git \
+    netcat-traditional \
+    procps \
+    nano \
+    && rm -rf /var/lib/apt/lists/*
+
+# 2. Configure Locale
+RUN sed -i -e 's/# en_US.UTF-8 UTF-8/en_US.UTF-8 UTF-8/' /etc/locale.gen && \
+    dpkg-reconfigure --frontend=noninteractive locales && \
+    update-locale LANG=en_US.UTF-8
+
+ENV LANG=en_US.UTF-8
+
+# 3. Create a non-root user 'pzuser'
+RUN useradd -m -d /home/pzuser -s /bin/bash pzuser
+
+# 4. Install SteamCMD the official way
+RUN apt-get update && \
+    echo steam steam/question select "I AGREE" | debconf-set-selections && \
+    echo steam steam/license note '' | debconf-set-selections && \
+    apt-get install -y steamcmd && \
+    rm -rf /var/lib/apt/lists/*
+
+# Create symlinks to ensure paths are always correct
+RUN ln -sf /usr/games/steamcmd /usr/bin/steamcmd
+
+# 5. Setup directories and permissions
+USER pzuser
+WORKDIR /home/pzuser
+
+# Create standard directories for volume mounting
+RUN mkdir -p /home/pzuser/server /home/pzuser/Zomboid
+
+# 6. Copy the entrypoint script
+COPY --chown=pzuser:pzuser start.sh /home/pzuser/start.sh
+
+# Remove Windows line endings (CRLF) to prevent 'command not found' errors
+RUN sed -i 's/\r$//' /home/pzuser/start.sh
+
+RUN chmod +x /home/pzuser/start.sh
+
+# 7. Expose Ports
+EXPOSE 16261/udp 16262/udp 8766/udp 27015/tcp
+
+# 8. HEALTHCHECK
+HEALTHCHECK --interval=30s --timeout=10s --start-period=2m \
+  CMD pgrep -f "zombie.network.GameServer" > /dev/null || exit 1
+
+STOPSIGNAL SIGTERM
+
+# 9. Start the container
+ENTRYPOINT ["/home/pzuser/start.sh"]
