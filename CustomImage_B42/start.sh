@@ -71,36 +71,63 @@ env | grep '^CFG_' | while read -r line ; do
     fi
 done
 
-echo "--- Starting Project Zomboid Server ---"
-cd "$INSTALL_DIR" || exit
+# 5. Configure JVM Memory & Extra Args via ProjectZomboid64.json
+JVM_CONFIG_FILE="$INSTALL_DIR/ProjectZomboid64.json"
 PZ_JVM_MEMORY="${PZ_JVM_MEMORY:-4g}"
 
-# 5. Start Server in Background with Pipe Input
+if [ -f "$JVM_CONFIG_FILE" ]; then
+    echo "--- Configuration: Applying PZ_JVM_MEMORY and PZ_JVM_EXTRA_ARGS to ProjectZomboid64.json ---"
+
+    # Build a JSON array from the space-separated PZ_JVM_EXTRA_ARGS env var (if any)
+    extra_args_json="[]"
+    if [ -n "$PZ_JVM_EXTRA_ARGS" ]; then
+        extra_args_json=$(printf '%s\n' $PZ_JVM_EXTRA_ARGS | jq -R . | jq -s .)
+    fi
+
+    tmp_file=$(mktemp)
+    jq --arg mem "$PZ_JVM_MEMORY" --argjson extra "$extra_args_json" '
+        .vmArgs = ((.vmArgs // []) | map(select((startswith("-Xmx") or startswith("-Xms")) | not)))
+                  + ["-Xmx\($mem)", "-Xms\($mem)"]
+                  + $extra
+    ' "$JVM_CONFIG_FILE" > "$tmp_file" && mv "$tmp_file" "$JVM_CONFIG_FILE"
+else
+    echo "WARNING: $JVM_CONFIG_FILE not found; skipping JVM memory/args injection."
+fi
+
+echo "--- Starting Project Zomboid Server ---"
+cd "$INSTALL_DIR" || exit
+
+# 6. Start Server in Background with Pipe Input
 tail -f "$PIPE" | ./start-server.sh \
     -servername "$SERVER_NAME" \
-    -adminpassword "${ADMIN_PASSWORD:-12345}" \
-    -Xmx$PZ_JVM_MEMORY \
-    -Xms$PZ_JVM_MEMORY &
+    -adminpassword "${ADMIN_PASSWORD:-12345}" &
 
 # Capture the Server PID
 SERVER_PID=$!
 echo "Server PID: $SERVER_PID"
 
-# 6. Define Shutdown Function
+# 7. Define Shutdown Function
 shutdown_server() {
     echo "--- Caught Signal: Sending 'quit' to server... ---"
     echo "quit" > "$PIPE"
-    
+
     echo "--- Waiting for server (PID $SERVER_PID) to save and exit... ---"
     wait "$SERVER_PID"
     echo "--- Server exited cleanly. ---"
     exit 0
 }
 
-# 7. Register Trap
+# 8. Register Trap
 trap 'shutdown_server' SIGTERM SIGINT
 
-# 8. Wait Loop
+# 9. Wait Loop
 while kill -0 "$SERVER_PID" >/dev/null 2>&1; do
     wait "$SERVER_PID"
 done
+
+# Reached when the server process ends on its own rather than via SIGTERM - most
+# often an RCON "quit" sent by the mod-watcher to apply a Workshop update.
+# Exiting here stops the container, and the "restart: unless-stopped" policy
+# starts it again, which re-runs the steamcmd update above.
+echo "--- Server process exited; container will restart via Docker restart policy. ---"
+exit 0

@@ -21,8 +21,11 @@ services:
     environment:
       - SERVER_NAME=MySurvivorServer
       - ADMIN_PASSWORD=${ADMIN_PASSWORD}
+      # Sets -Xmx/-Xms in server_files/ProjectZomboid64.json (vmArgs)
       - PZ_JVM_MEMORY=12g
-      
+      # Optional: space-separated extra JVM flags, appended into the same vmArgs array
+      # - PZ_JVM_EXTRA_ARGS=-Duser.language=en -Duser.country=US
+
       # --- SERVER SETTINGS (Injects into .ini) ---
       # Add "CFG_" prefix to any setting from pzwiki.net/wiki/Server_settings
       
@@ -35,6 +38,7 @@ services:
       - CFG_ShowSafety=true       # Show skull icon for PVP status
 
       # [Mods]
+      # NOTE: Keep this list identical to mod-watcher's WORKSHOP_ITEMS below so update checks cover every installed mod.
       - CFG_WorkshopItems=3077900375;2896041179;3508537032;3171167894;3624971238;3437629766;3461263912;2950902979;3760450908;2366717227;3774826484;3772052709;3771083376;3750253491;3671176591;3749026793;3543229299;3281755175;3618557184;3717902500;3162566044;3413150945;2503622437;3676251425;3426448380;3747951740;3775407557;3606009875;3677430162;3690404044;3729663486;3635856965;2983905789;3396867685;3646787580;3746603021;3648051123;3425038705;3607686447;3635591071;3330403100;3670064951;2625625421;2805630347;2642541073;3435796523;2799152995;2618213077;2897390033;3740300378;3457132019;3501302358;3436499337;3637364024;3610677934;3722064198;3773834525;3672792485;
       
       - CFG_Mods=ChuckleberryFinnAlertSystem;errorMagnifier;PROJECTRVInterior42;CVI;damnlib;78amgeneralM35A2;82oshkoshM911;84merc;88toyotaHilux;92amgeneralM998;92amgeneralM998extra;78amgeneralM35A2extra;97bushmaster;RebalancedPropMoving;ArmorMakesSense;better-auto-mechanics;KI5campers;CleanHotBar;NeatUI_Framework;CleanUI;VB_CommonSense;isoContainers;EQUIPMENT_UI;FWOFitnessWorkoutOverhaul;FWOBenchPress&Treadmill;HereGoesTheSun;HBVCEFb42;HBAC;SWMG;ImmersiveBlackouts;ImmersiveReading;ImmersiveSearching;stanks_suicide;InjuredZombiesStumble;JB_BugsInLights;JumboTreeIndoorFix;YAPZLib;KI5minifixes;ZomboidDrugzz;MoreDamagedObjects;DG_MIVehicles;NutritionMakesSense;phuncure2;RealisticDash;SkillRecoveryJournal;SpawnSelector;SpecLoot;StarvingZombies;SwapIt;ThumpingAttractsZombies;TopplingZombies;KI5trailers;TrippingZombies;VanillaVehiclesAnimated;MarzVanillaGuns;VMZNEW;VSUIKI5;dustinguished_bolt_cutters;HelicopterEventExpansionFramework;WanderingZombiesWIP
@@ -80,3 +84,49 @@ services:
       # where this docker-compose.yml is located.
       - ./zomboid_data:/home/pzuser/Zomboid
       - ./server_files:/home/pzuser/server
+
+  mod-watcher:
+    build: ./mod_watcher
+    container_name: pz-mod-watcher
+    restart: unless-stopped
+    depends_on:
+      - pz-server
+    # Deliberately no "env_file": the watcher only needs RCON_PASSWORD, which is
+    # interpolated from ./.env below. Loading the whole file would also hand it
+    # ADMIN_PASSWORD and CFG_PASSWORD for no reason.
+    environment:
+      # NOTE: Keep this list identical to pz-server's CFG_WorkshopItems above.
+      - WORKSHOP_ITEMS=3077900375;2896041179;3508537032;3171167894;3624971238;3437629766;3461263912;2950902979;3760450908;2366717227;3774826484;3772052709;3771083376;3750253491;3671176591;3749026793;3543229299;3281755175;3618557184;3717902500;3162566044;3413150945;2503622437;3676251425;3426448380;3747951740;3775407557;3606009875;3677430162;3690404044;3729663486;3635856965;2983905789;3396867685;3646787580;3746603021;3648051123;3425038705;3607686447;3635591071;3330403100;3670064951;2625625421;2805630347;2642541073;3435796523;2799152995;2618213077;2897390033;3740300378;3457132019;3501302358;3436499337;3637364024;3610677934;3722064198;3773834525;3672792485;
+      # How often to poll the Steam Workshop API for updates (seconds)
+      - POLL_INTERVAL_SECONDS=600
+      # pz-server is the compose service name, reachable on the internal network
+      - RCON_HOST=pz-server
+      - RCON_PORT=27015
+      - RCON_PASSWORD=${RCON_PASSWORD}
+
+      # --- RESTART TIMING ---
+      # On detecting an update the watcher waits for the server to empty out before
+      # restarting. If it is still occupied after MAX_RESTART_WAIT_SECONDS, it warns
+      # players and restarts anyway.
+      - MAX_RESTART_WAIT_SECONDS=3600
+      # How often to re-check the connected player count while waiting
+      - EMPTY_CHECK_INTERVAL_SECONDS=60
+      # Short pause after the server empties, in case someone is reconnecting
+      - EMPTY_RESTART_GRACE_SECONDS=10
+      # Notice given to players before a forced (non-empty) restart
+      - FORCED_RESTART_WARNING_SECONDS=300
+      # How long to wait for the RCON port to close before declaring the restart failed
+      - SHUTDOWN_TIMEOUT_SECONDS=120
+
+    # No Docker socket, no host access. The watcher restarts the server by sending
+    # the RCON "quit" command: the game process exits, start.sh falls through, the
+    # container stops, and pz-server's own "restart: unless-stopped" policy brings
+    # it back - which re-runs steamcmd and pulls the updated mods.
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    volumes:
+      - ./mod_watcher_state:/state

@@ -24,10 +24,10 @@ Run these commands in the directory containing your `docker-compose.yml`:
 
 ```bash
 # Create the data directories
-mkdir -p zomboid_data server_files
+mkdir -p zomboid_data server_files mod_watcher_state
 
 # Set ownership to UID 1000 (standard Linux user)
-sudo chown -R 1000:1000 zomboid_data server_files
+sudo chown -R 1000:1000 zomboid_data server_files mod_watcher_state
 ```
 
 ### 3. Launch the Server
@@ -85,6 +85,52 @@ environment:
 docker compose up -d
 ```
 *(No container rebuild needed).*
+
+---
+
+## 🔄 Automatic Mod Updates (`mod-watcher`)
+
+The stack includes a `mod-watcher` sidecar that polls the Steam Workshop API for
+changes to your subscribed mods and restarts the server when one is published.
+
+### How the restart works (and why there's no Docker socket)
+
+A sidecar that restarts a container would normally mount `/var/run/docker.sock`,
+which is effectively root on the host. This one doesn't need it:
+
+1. `mod-watcher` detects an updated mod and warns players via RCON `servermsg`.
+2. It waits for the server to empty out, then sends RCON `save` and `quit`.
+3. The game process exits, so `start.sh` finishes and the container stops.
+4. `pz-server`'s `restart: unless-stopped` policy starts it again, which re-runs
+   `steamcmd +app_update` — and that's what actually downloads the new mod files.
+
+Docker itself performs the restart, so the watcher never touches the Docker API.
+It runs unprivileged with a read-only filesystem and all capabilities dropped;
+its only reach is outbound HTTPS to Steam and RCON to the game server.
+
+> **Keep the mod lists in sync.** `WORKSHOP_ITEMS` on `mod-watcher` must match
+> `CFG_WorkshopItems` on `pz-server`, or updates to the missing mods won't be seen.
+
+### Watcher Environment Variables
+
+| Variable | Description | Default |
+| :--- | :--- | :--- |
+| `WORKSHOP_ITEMS` | Semicolon-separated Workshop IDs to watch | *(required)* |
+| `POLL_INTERVAL_SECONDS` | How often to check Steam for updates | `600` |
+| `MAX_RESTART_WAIT_SECONDS` | How long to wait for an empty server before forcing a restart | `3600` |
+| `EMPTY_CHECK_INTERVAL_SECONDS` | How often to re-check the player count while waiting | `60` |
+| `EMPTY_RESTART_GRACE_SECONDS` | Pause after the server empties, in case of a reconnect | `10` |
+| `FORCED_RESTART_WARNING_SECONDS` | Notice given before a forced (non-empty) restart | `300` |
+| `SHUTDOWN_TIMEOUT_SECONDS` | How long to wait for the RCON port to close before declaring failure | `120` |
+
+If a restart can't be confirmed, the watcher leaves its saved timestamps
+untouched and retries on the next poll — so a transient failure self-heals
+rather than silently skipping the update.
+
+### Watcher Logs
+```bash
+docker logs -f pz-mod-watcher
+```
 
 ---
 
