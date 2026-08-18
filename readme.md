@@ -24,10 +24,10 @@ Run these commands in the directory containing your `docker-compose.yml`:
 
 ```bash
 # Create the data directories
-mkdir -p zomboid_data server_files
+mkdir -p zomboid_data server_files mod_watcher_state
 
 # Set ownership to UID 1000 (standard Linux user)
-sudo chown -R 1000:1000 zomboid_data server_files
+sudo chown -R 1000:1000 zomboid_data server_files mod_watcher_state
 ```
 
 ### 3. Launch the Server
@@ -55,6 +55,17 @@ Server settings can be managed directly through `docker-compose.yml` environment
 | `SERVER_NAME` | Name of the save file and config entry | `servertest` |
 | `ADMIN_PASSWORD` | Password for the default admin account | `ChangeThis...` |
 | `PZ_JVM_MEMORY` | Java Heap Size allocation (e.g., `4g`, `8g`) | `4g` |
+| `PZ_JVM_EXTRA_ARGS` | Space-separated extra JVM flags (e.g., `-Duser.language=en`) | *(none)* |
+
+> **Note on JVM settings:** Project Zomboid itself does not read these variables. On every boot,
+> `start.sh` rewrites the `vmArgs` array in `server_files/ProjectZomboid64.json` to match them.
+> This runs *after* SteamCMD, because `app_update ... validate` restores any game file that
+> differs from Steam's manifest — so hand-editing that JSON is not durable.
+>
+> Both variables are declarative: the injected args are tracked in
+> `server_files/.pz_managed_vmargs.json`, so changing a value replaces it and removing a flag
+> from `docker-compose.yml` actually removes it on the next restart, rather than leaving the old
+> entry behind on the persisted volume.
 
 ### Game Settings (`CFG_` Injection)
 Any environment variable prefixed with `CFG_` is automatically stripped and appended to `servertest.ini` on startup.
@@ -85,6 +96,92 @@ environment:
 docker compose up -d
 ```
 *(No container rebuild needed).*
+
+---
+
+## 🔄 Automatic Mod Updates (`mod-watcher`)
+
+The stack includes a `mod-watcher` sidecar that polls the Steam Workshop API for
+changes to your subscribed mods and restarts the server when one is published.
+
+### How the restart works (and why there's no Docker socket)
+
+A sidecar that restarts a container would normally mount `/var/run/docker.sock`,
+which is effectively root on the host. This one doesn't need it:
+
+1. `mod-watcher` detects an updated mod and warns players via RCON `servermsg`.
+2. It waits for the server to empty out, then sends RCON `save` and `quit`.
+3. The game process exits, so `start.sh` finishes and the container stops.
+4. `pz-server`'s `restart: unless-stopped` policy starts it again, which re-runs
+   `steamcmd +app_update` — and that's what actually downloads the new mod files.
+
+Docker itself performs the restart, so the watcher never touches the Docker API.
+It runs unprivileged with a read-only filesystem and all capabilities dropped;
+its only reach is outbound HTTPS to Steam and RCON to the game server.
+
+> **Keep the mod lists in sync.** `WORKSHOP_ITEMS` on `mod-watcher` must match
+> `CFG_WorkshopItems` on `pz-server`, or updates to the missing mods won't be seen.
+
+### Watcher Environment Variables
+
+| Variable | Description | Default |
+| :--- | :--- | :--- |
+| `WORKSHOP_ITEMS` | Semicolon-separated Workshop IDs to watch | *(required)* |
+| `POLL_INTERVAL_SECONDS` | How often to check Steam for updates | `600` |
+| `MAX_RESTART_WAIT_SECONDS` | How long to wait for an empty server before forcing a restart | `3600` |
+| `EMPTY_CHECK_INTERVAL_SECONDS` | How often to re-check the player count while waiting | `60` |
+| `EMPTY_RESTART_GRACE_SECONDS` | Pause after the server empties, in case of a reconnect | `10` |
+| `FORCED_RESTART_WARNING_SECONDS` | Notice given before a forced (non-empty) restart | `300` |
+| `SHUTDOWN_TIMEOUT_SECONDS` | How long to wait for the RCON port to close before declaring failure | `120` |
+
+If a restart can't be confirmed, the watcher leaves its saved timestamps
+untouched and retries on the next poll — so a transient failure self-heals
+rather than silently skipping the update.
+
+### Watcher Logs
+```bash
+docker logs -f pz-mod-watcher
+```
+
+### Verifying the Watcher (`probe.py`)
+
+The watcher spends most of its life doing nothing, so a broken assumption can sit
+unnoticed until the day it actually needs to restart the server. `probe.py` checks
+those assumptions on demand:
+
+```bash
+docker compose exec mod-watcher python probe.py
+```
+
+It is strictly read-only — it authenticates over RCON and runs the `players`
+command, but never sends `save`, `quit`, or `servermsg`, and never writes the
+state file. It is safe to run on a populated server. Exit status is `0` when
+nothing failed.
+
+What it checks:
+
+* **RCON packet alignment.** `rcon_command()` reads exactly one packet per
+  request. Some RCON implementations send an empty packet before the auth
+  response; if this server does, every later read is off by one — command output
+  comes back empty and a wrong password is silently accepted.
+* **Player count parsing.** That the real `players` output matches
+  `PLAYER_COUNT_RE`. If it doesn't, `rcon_player_count()` returns `None`, which
+  the watcher treats as "occupied" — so it would never restart on an empty
+  server and would always wait out `MAX_RESTART_WAIT_SECONDS` instead.
+* **Steam API reachability**, plus any configured mod IDs Steam has no entry for
+  (delisted, private, or mistyped) — those are silently skipped by update checks.
+* **State file writability**, the usual cause being a root-owned
+  `./mod_watcher_state` mount versus the container's UID 1000.
+* **Pending restarts** — whether the recorded baseline already differs from
+  current Steam timestamps.
+
+Run it once with the server empty and once with someone connected; the zero-player
+and non-zero paths parse differently. Two optional flags:
+
+| Flag | Purpose |
+| :--- | :--- |
+| `--test-bad-password` | Also confirm a wrong password is rejected. Off by default, since some RCON implementations throttle or ban on failed auth. |
+| `--skip-steam` | RCON checks only; no outbound network. |
 
 ---
 

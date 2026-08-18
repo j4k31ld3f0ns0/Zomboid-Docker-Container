@@ -1,0 +1,19 @@
+FROM python:3.12-slim
+
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY mod_watcher.py .
+# Read-only diagnostic, run on demand:
+#   docker compose exec mod-watcher python probe.py
+COPY probe.py .
+
+# Runs unprivileged: this container needs no host access at all, only outbound
+# HTTPS to the Steam API and an RCON connection to the game server.
+# UID 1000 matches the ownership expected on the ./mod_watcher_state volume.
+RUN useradd -m -u 1000 watcher
+USER watcher
+
+CMD ["python", "-u", "mod_watcher.py"]
