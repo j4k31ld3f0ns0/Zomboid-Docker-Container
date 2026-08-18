@@ -359,8 +359,16 @@ shutdown_server() {
 trap 'shutdown_server' SIGTERM SIGINT
 
 # 9. Wait Loop
-while kill -0 "$SERVER_PID" >/dev/null 2>&1; do
-    wait "$SERVER_PID"
+# Polls instead of using "wait". The server runs as the tail end of a pipeline
+# ("tail -f $PIPE | ./start-server.sh"), and bash's wait on a pipeline member
+# blocks until the ENTIRE job finishes. The tail feeding the command FIFO never
+# exits, so wait blocks forever even once the game process is gone -- PID 1 sits
+# in do_wait and the container never stops, so "restart: unless-stopped" never
+# fires. That is exactly what happened when mod-watcher shut the server down over
+# RCON: the game saved and exited cleanly, and nothing noticed.
+# sleep is interruptible, so the SIGTERM trap below still fires promptly.
+while kill -0 "$SERVER_PID" 2>/dev/null; do
+    sleep 5
 done
 
 # Only reached when the server exits on its own; the shutdown trap exits

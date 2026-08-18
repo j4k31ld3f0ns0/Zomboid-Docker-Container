@@ -25,10 +25,10 @@ A custom Docker setup for hosting a Project Zomboid **Build 42** dedicated serve
 
 ### 2. Create the `.env` file
 
-`docker-compose.yml` reads three secrets from `CustomImage_B42/.env`:
+`docker-compose.yml` reads three secrets from `Build42/.env`:
 
 ```bash
-cp CustomImage_B42/.env.example CustomImage_B42/.env
+cp Build42/.env.example Build42/.env
 # then edit it:
 #   ADMIN_PASSWORD=...    admin account
 #   CFG_PASSWORD=...      password players type to join
@@ -46,7 +46,7 @@ Because the container runs as a non-root user (UID `1000`), host directories
 must exist with the right ownership to prevent "Permission Denied" crashes.
 
 ```bash
-cd CustomImage_B42
+cd Build42
 mkdir -p zomboid_data server_files
 sudo chown -R 1000:1000 zomboid_data server_files
 ```
@@ -79,6 +79,9 @@ docker logs -f zomboid
 | `STALL_LIMIT` | Seconds of zero CPU **and** zero disk activity before declaring the server wedged | `30` |
 | `PZ_BACKUP_KEEP` | Pre-update world backups to retain | `5` |
 | `MIN_RUNTIME_SECONDS` | Server exiting sooner than this is treated as a failed launch | `60` |
+| `STARTUP_STALL_LIMIT` | Seconds of no meaningful progress during boot before the startup is called wedged | `300` |
+| `STARTUP_MIN_TICKS_PER_SEC` | CPU ticks/sec that count as real work during boot | `5` |
+| `STARTUP_MIN_BYTES_PER_SEC` | Bytes/sec written that count as real work during boot | `10240` |
 
 ### Game Settings (`CFG_` Injection)
 
@@ -174,6 +177,36 @@ failing check spends ~10s in the RCON timeout first. To detect faster, lower
 `HEALTH_FAIL_THRESHOLD` rather than `interval` — the threshold is what provides
 immunity to false positives during long autosaves.
 
+### Failed startups that hang
+
+A fatal script error does not always exit the process: Project Zomboid logs
+`Server Terminated.` and the JVM can stay resident. `start.sh` only notices a
+server that *exits*, so without extra help the container would sit in `starting`
+for the whole 45m `start_period` and then stay `unhealthy` forever — a crash
+that reads like a slow boot.
+
+The health check therefore watches boot progress the same way the shutdown does,
+but on a **rate**, not on change: a crashed-but-resident JVM still burns ~0.5 CPU
+ticks/sec from background threads, and keeps dribbling bytes to disk (~56
+bytes/sec measured on a real crash), so "did anything change" never fires on
+either signal. **Both** are therefore measured as rates. If the server stays
+under `STARTUP_MIN_TICKS_PER_SEC` *and* `STARTUP_MIN_BYTES_PER_SEC` for
+`STARTUP_STALL_LIMIT`, the startup is judged wedged, and that verdict latches so
+the restart threshold is reached in a few checks rather than a few stall windows.
+Real work in a later window clears the latch, so a transient stall self-heals.
+
+**Detection can take up to 2x `STARTUP_STALL_LIMIT`.** Progress is averaged over
+a fixed window, so the window that happens to span the moment of failure is
+diluted by the work done before it and resets instead of latching; only the next
+full window is entirely idle. Observed on a real crash: the straddling window
+showed ~31 ticks/sec and 407MB written and correctly declined to latch, while a
+sample taken minutes later showed 3 ticks in 10s and zero writes. So budget
+~10 minutes at the default 300s, not ~5.
+
+Note this restarts on a *deterministic* startup failure too, such as a mod with a
+broken recipe — each loop costs a full boot. Check the logs rather than assuming
+a restart loop is transient.
+
 ### Shutdown: saving vs. wedged
 
 A server writing a large save and a deadlocked server both stop answering RCON,
@@ -210,8 +243,8 @@ The build id lives beside the save rather than in `server_files` so that wiping
 and re-downloading the game cannot lose the history.
 
 ```bash
-cat CustomImage_B42/zomboid_data/.pz_buildid
-ls -lh CustomImage_B42/zomboid_data/backups/
+cat Build42/zomboid_data/.pz_buildid
+ls -lh Build42/zomboid_data/backups/
 ```
 
 ### Install validation
@@ -255,29 +288,88 @@ Docker itself performs the restart, so the watcher never touches the Docker API.
 It runs unprivileged with a read-only filesystem and all capabilities dropped;
 its only reach is outbound HTTPS to Steam and RCON to the game server.
 
-> **Keep the mod lists in sync.** `WORKSHOP_ITEMS` on `mod-watcher` must match
-> `CFG_WorkshopItems` on `pz-server`, or updates to the missing mods won't be seen.
+> **The mod list is defined once.** `x-workshop-items` at the top of
+> `docker-compose.yml` is a YAML anchor that both `CFG_WorkshopItems` and
+> `WORKSHOP_ITEMS` alias, so they cannot drift. Add or remove a mod there and
+> both services see it. Because YAML aliases substitute whole nodes rather than
+> fragments of a string, both `environment:` blocks are mappings
+> (`KEY: "value"`) rather than `- KEY=value` lists.
 
 ### Watcher Environment Variables
 
 | Variable | Description | Default |
 | :--- | :--- | :--- |
-| `WORKSHOP_ITEMS` | Semicolon-separated Workshop IDs to watch | *(required)* |
+| `WORKSHOP_ITEMS` | Workshop IDs to watch. Aliased from `x-workshop-items`, shared with `CFG_WorkshopItems` | *(required)* |
 | `POLL_INTERVAL_SECONDS` | How often to check Steam for updates | `600` |
 | `MAX_RESTART_WAIT_SECONDS` | How long to wait for an empty server before forcing a restart | `3600` |
 | `EMPTY_CHECK_INTERVAL_SECONDS` | How often to re-check the player count while waiting | `60` |
 | `EMPTY_RESTART_GRACE_SECONDS` | Pause after the server empties, in case of a reconnect | `10` |
 | `FORCED_RESTART_WARNING_SECONDS` | Notice given before a forced (non-empty) restart | `300` |
-| `SHUTDOWN_TIMEOUT_SECONDS` | How long to wait for the RCON port to close before declaring failure | `120` |
+| `SHUTDOWN_TIMEOUT_SECONDS` | How long to wait for the RCON port to close before declaring failure | `300` |
 
 If a restart can't be confirmed, the watcher leaves its saved timestamps
 untouched and retries on the next poll — so a transient failure self-heals
 rather than silently skipping the update.
 
+### Interaction with the health check
+
+Both the watcher and the health check talk to the server over RCON, and both
+tolerate the other:
+
+* The first-run baseline needs only the Steam API, so the watcher starts cleanly
+  next to a server still doing its 15–30 minute first boot. `depends_on`
+  deliberately does **not** use `condition: service_healthy` — against a 45m
+  `start_period` that would make `docker compose up -d` block.
+* If a mod update lands while RCON is unreachable, the watcher skips the restart
+  and retries next cycle instead of failing.
+* During a watcher-initiated restart the server stops answering RCON, so the
+  health check begins counting failures. A normal save finishes long before the
+  6-failure threshold (a clean idle shutdown measured 8s). If it ever did not,
+  the health check would signal the same save-and-quit path the watcher already
+  triggered — they agree rather than fight, and the shutdown's stall detection
+  sees the save still making progress and lets it finish.
+* `SHUTDOWN_TIMEOUT_SECONDS` must exceed the worst-case save. Set too low, the
+  watcher calls a successful restart "unconfirmed", never commits the new
+  timestamps, and restarts a second time on the next poll.
+
 ### Watcher Logs
 ```bash
 docker logs -f pz-mod-watcher
 ```
+
+### Testing the restart algorithm
+
+The player-presence branches are impractical to test against a live server: the
+forced-restart path needs `MAX_RESTART_WAIT_SECONDS` to elapse (an hour by
+default) with someone actually logged in, and the "count unavailable" path needs
+RCON broken in a specific way. `test_restart_logic.py` runs the real
+`graceful_restart()` against a stub RCON server serving a scripted sequence of
+player counts, so every branch runs deterministically in seconds:
+
+```bash
+docker compose run --rm --entrypoint python mod-watcher test_restart_logic.py
+```
+
+| Scenario | Expected |
+| :--- | :--- |
+| Server already empty | restarts immediately |
+| Players online, then leave | defers, restarts once empty |
+| Stays occupied past the cap | warns players, restarts anyway |
+| Player count unparseable | treated as occupied, ends in a forced restart |
+
+The stub answers auth with two packets exactly as a real server does, so it also
+guards against a regression to the single-read handshake bug.
+
+To exercise the empty path against the *real* server instead, seed a stale
+timestamp and let the watcher poll immediately:
+
+```bash
+python3 -c "import json;p='mod_watcher_state/mod_watcher_state.json';d=json.load(open(p));d[sorted(d)[0]]=1;json.dump(d,open(p,'w'))"
+docker compose restart mod-watcher
+```
+
+For the occupied path end-to-end, do the same with someone logged in and
+`MAX_RESTART_WAIT_SECONDS` temporarily lowered, then have them disconnect.
 
 ### Verifying the Watcher (`probe.py`)
 
@@ -296,10 +388,11 @@ nothing failed.
 
 What it checks:
 
-* **RCON packet alignment.** `rcon_command()` reads exactly one packet per
-  request. Some RCON implementations send an empty packet before the auth
-  response; if this server does, every later read is off by one — command output
-  comes back empty and a wrong password is silently accepted.
+* **RCON packet alignment.** Build 42 *does* send an empty `RESPONSE_VALUE`
+  before the `AUTH_RESPONSE`, which is exactly the off-by-one this check was
+  written to catch — command output came back empty and a wrong password was
+  silently accepted. `_authenticate()` now drains to the `AUTH_RESPONSE`, and the
+  check exercises that function directly rather than counting packets.
 * **Player count parsing.** That the real `players` output matches
   `PLAYER_COUNT_RE`. If it doesn't, `rcon_player_count()` returns `None`, which
   the watcher treats as "occupied" — so it would never restart on an empty
@@ -413,12 +506,16 @@ without a path. It is a warning, not a failure.
 ## 📁 Repository Layout
 
 ```
-CustomImage_B42/
+Build42/
 ├── dockerfile               # Debian bookworm + SteamCMD + jq + rcon-cli
 ├── start.sh                 # entrypoint: update, validate, back up, launch, shutdown
 ├── healthcheck.sh           # three-stage health check
-├── docker-compose.yml       # production stack
+├── docker-compose.yml       # production stack (pz-server + mod-watcher)
 ├── docker-compose.test.yml  # isolated test overlay
+├── mod_watcher/             # workshop update watcher (see below)
+│   ├── mod_watcher.py       # poll Steam, restart server when mods change
+│   └── probe.py             # read-only RCON/Steam/state diagnostic
+├── mod_watcher_state/       # watcher's recorded mod timestamps
 ├── .env                     # secrets (gitignored)
 ├── .env.example             # template for .env
 ├── server_files/            # game install (SteamCMD, gitignored)

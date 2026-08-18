@@ -107,16 +107,42 @@ def check_handshake(cfg, timeout):
                 report(FAIL, "Server rejected the password (auth id -1)", "Check RCON_PASSWORD vs CFG_RCONPassword.")
                 return None
 
-            if len(auth_packets) == 1:
-                report(PASS, "Auth returns exactly 1 packet, matching mod_watcher's single read")
-            else:
+            if not any(ptype == mw.SERVERDATA_AUTH_RESPONSE for _, ptype, _ in auth_packets):
                 report(
                     FAIL,
-                    f"Auth returns {len(auth_packets)} packets but mod_watcher reads only 1",
-                    "The stream is off by one from here on: rcon_command() would return the\n"
-                    "leftover auth packet as the command body, and a wrong password would go\n"
-                    "undetected. rcon_command() needs to drain until the AUTH_RESPONSE.",
+                    "Auth stream contains no SERVERDATA_AUTH_RESPONSE packet",
+                    "Without it a bad password cannot be detected: the -1 id only ever\n"
+                    "appears on that packet.",
                 )
+            else:
+                report(PASS, f"Auth stream ends with SERVERDATA_AUTH_RESPONSE ({len(auth_packets)} packet(s))")
+
+            # Don't infer alignment from a packet count -- exercise the real
+            # handshake. A fresh socket keeps the drain above from interfering.
+            # If _authenticate() under-reads, the first command read comes back
+            # with a leftover auth packet's empty body instead of the reply.
+            try:
+                with socket.create_connection(
+                    (cfg["rcon_host"], cfg["rcon_port"]), timeout=timeout
+                ) as probe_sock:
+                    probe_sock.settimeout(timeout)
+                    mw._authenticate(probe_sock, cfg["rcon_password"])
+                    mw._send_packet(probe_sock, 2, mw.SERVERDATA_EXECCOMMAND, "players")
+                    _, _, aligned_body = mw._read_packet(probe_sock)
+                if aligned_body.strip():
+                    report(PASS, "_authenticate() leaves the stream aligned; first command read returned a body")
+                else:
+                    report(
+                        FAIL,
+                        "Stream misaligned after _authenticate(): first command read returned an empty body",
+                        "rcon_command() is returning a leftover auth packet rather than the\n"
+                        "command reply. _authenticate() must drain to the AUTH_RESPONSE.",
+                    )
+            except PermissionError as exc:
+                report(FAIL, "_authenticate() rejected the password", exc)
+                return None
+            except OSError as exc:
+                report(FAIL, "Could not re-run the handshake for the alignment check", exc)
 
             # Same question for a command response, on the now-authenticated socket.
             mw._send_packet(sock, 2, mw.SERVERDATA_EXECCOMMAND, "players")
