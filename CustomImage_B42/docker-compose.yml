@@ -1,18 +1,37 @@
 services:
   pz-server:
     # CHANGE: Replace "build: ." with "image:" pointing to your uploaded container
-    build: . 
+    build: .
     # image: your_username/project-zomboid-server:latest
     env_file:
     - ./.env
     container_name: zomboid
     restart: unless-stopped
-    
+
     # [CRITICAL SHUTDOWN SETTING]
     # Docker normally kills a container after 10 seconds if it doesn't stop.
     # PZ needs time to save the map to disk. 120s prevents world corruption.
-    stop_grace_period: 120s
-    
+    stop_grace_period: 180s
+
+    # [HEALTH CHECK]
+    # start_period is deliberately huge: on a cold volume SteamCMD pulls ~7GB
+    # and then 60+ workshop mods before the game process even exists. While the
+    # start period is running a failing check reports "starting", never
+    # "unhealthy", and does not burn retries.
+    #
+    # start_interval (Docker 25+/API 1.44+) is what makes that free: during the
+    # start period the check runs every 10s instead of every 30s, and the first
+    # success ends the period immediately. So a warm restart still flips to
+    # healthy seconds after the server finishes loading, and only a genuinely
+    # broken cold boot sits in "starting" for the full 45m.
+    healthcheck:
+      test: ["CMD", "/home/pzuser/healthcheck.sh"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+      start_period: 45m
+      start_interval: 10s
+
     ports:
       - "16261:16261/udp"
       - "16262:16262/udp"
@@ -23,12 +42,22 @@ services:
       - ADMIN_PASSWORD=${ADMIN_PASSWORD}
       # Sets -Xmx/-Xms in server_files/ProjectZomboid64.json (vmArgs)
       - PZ_JVM_MEMORY=12g
-      # Optional: space-separated extra JVM flags, appended into the same vmArgs array
-      # - PZ_JVM_EXTRA_ARGS=-Duser.language=en -Duser.country=US
+
+      # Consecutive failed health checks (30s apart) before the container
+      # restarts itself. Only counted after the server has answered RCON at
+      # least once, so a slow first boot can never trigger it. 6 x 30s = 3min,
+      # long enough to ride out a long autosave without a false restart.
+      - HEALTH_FAIL_THRESHOLD=6
+      # Must stay below stop_grace_period above.
+      - SHUTDOWN_TIMEOUT=150
+      # Pre-update world backups kept in ./zomboid_data/backups. A backup is
+      # taken only when SteamCMD pulls a new build id, before the new binary
+      # is allowed to open the save.
+      - PZ_BACKUP_KEEP=5
 
       # --- SERVER SETTINGS (Injects into .ini) ---
       # Add "CFG_" prefix to any setting from pzwiki.net/wiki/Server_settings
-      
+
       # [Player Settings]
       - CFG_MaxPlayers=16
       - CFG_PVP=true
@@ -40,10 +69,10 @@ services:
       # [Mods]
       # NOTE: Keep this list identical to mod-watcher's WORKSHOP_ITEMS below so update checks cover every installed mod.
       - CFG_WorkshopItems=3077900375;2896041179;3508537032;3171167894;3624971238;3437629766;3461263912;2950902979;3760450908;2366717227;3774826484;3772052709;3771083376;3750253491;3671176591;3749026793;3543229299;3281755175;3618557184;3717902500;3162566044;3413150945;2503622437;3676251425;3426448380;3747951740;3775407557;3606009875;3677430162;3690404044;3729663486;3635856965;2983905789;3396867685;3646787580;3746603021;3648051123;3425038705;3607686447;3635591071;3330403100;3670064951;2625625421;2805630347;2642541073;3435796523;2799152995;2618213077;2897390033;3740300378;3457132019;3501302358;3436499337;3637364024;3610677934;3722064198;3773834525;3672792485;
-      
+
       - CFG_Mods=ChuckleberryFinnAlertSystem;errorMagnifier;PROJECTRVInterior42;CVI;damnlib;78amgeneralM35A2;82oshkoshM911;84merc;88toyotaHilux;92amgeneralM998;92amgeneralM998extra;78amgeneralM35A2extra;97bushmaster;RebalancedPropMoving;ArmorMakesSense;better-auto-mechanics;KI5campers;CleanHotBar;NeatUI_Framework;CleanUI;VB_CommonSense;isoContainers;EQUIPMENT_UI;FWOFitnessWorkoutOverhaul;FWOBenchPress&Treadmill;HereGoesTheSun;HBVCEFb42;HBAC;SWMG;ImmersiveBlackouts;ImmersiveReading;ImmersiveSearching;stanks_suicide;InjuredZombiesStumble;JB_BugsInLights;JumboTreeIndoorFix;YAPZLib;KI5minifixes;ZomboidDrugzz;MoreDamagedObjects;DG_MIVehicles;NutritionMakesSense;phuncure2;RealisticDash;SkillRecoveryJournal;SpawnSelector;SpecLoot;StarvingZombies;SwapIt;ThumpingAttractsZombies;TopplingZombies;KI5trailers;TrippingZombies;VanillaVehiclesAnimated;MarzVanillaGuns;VMZNEW;VSUIKI5;dustinguished_bolt_cutters;HelicopterEventExpansionFramework;WanderingZombiesWIP
-      
-      
+
+
       # [Loot & World]
       # - CFG_HoursForLootRespawn=4383 # 0 = Never, 24 = Every day
       # - CFG_MaxItemsForLootRespawn=4
@@ -62,13 +91,13 @@ services:
       - CFG_EnableEventSmokeCurtainEvent=false
       - CFG_SpeedLimit=110.0
 
-      
+
       # [Server Visibility]
       - CFG_Public=false           # Visible in Steam Server Browser
       - CFG_PublicName=omg a zomboid server
       - CFG_PublicDescription=nvvy and gods gift to gaming manages this
       - CFG_Password=${CFG_PASSWORD}
-      
+
       # [Protection]
       #- CFG_DoLuaChecksum=true    # Kick players with mismatched mods
       - CFG_PingLimit=400         # Kick players with high ping
@@ -78,7 +107,7 @@ services:
       # [RCON]
       - CFG_RCONPort=27015
       - CFG_RCONPassword=${RCON_PASSWORD}
-      
+
     volumes:
       # The "./" syntax ensures these volumes are created in the relative directory
       # where this docker-compose.yml is located.

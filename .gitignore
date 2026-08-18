@@ -1,0 +1,14 @@
+# Secrets. .env holds ADMIN_PASSWORD / CFG_PASSWORD / RCON_PASSWORD.
+.env
+*.env
+!*.env.example
+
+# Game install: ~7GB, restored by SteamCMD on first boot.
+CustomImage_B42/server_files/
+
+# Worlds, configs, backups and the recorded build id.
+CustomImage_B42/zomboid_data/
+CustomImage_B42/zomboid_data_test/
+
+# Runtime state
+CustomImage_B42/mod_watcher_state

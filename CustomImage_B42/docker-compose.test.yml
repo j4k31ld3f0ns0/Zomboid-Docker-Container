@@ -1,0 +1,28 @@
+# Test overlay: isolated world, isolated ports, small heap, no mods.
+# Usage:
+#   docker compose -f docker-compose.yml -f docker-compose.test.yml -p zomboid-test up -d --build
+#   docker compose -p zomboid-test down
+#
+# Shares ./server_files with the main stack so SteamCMD doesn't re-download 7 GB.
+# Do NOT run this at the same time as the production stack.
+services:
+  pz-server:
+    container_name: zomboid-test
+    restart: "no"
+    stop_grace_period: 60s
+    ports: !override
+      - "16361:16261/udp"
+      - "16362:16262/udp"
+      - "8767:8766/udp"
+      - "27016:27015/tcp"
+    volumes: !override
+      - ./zomboid_data_test:/home/pzuser/Zomboid
+      - ./server_files:/home/pzuser/server
+    environment:
+      - SERVER_NAME=TestServer
+      - PZ_JVM_MEMORY=4g
+      - CFG_WorkshopItems=
+      - CFG_Mods=
+      - CFG_Map=Muldraugh, KY
+      - CFG_MaxPlayers=4
+      - CFG_Public=false
