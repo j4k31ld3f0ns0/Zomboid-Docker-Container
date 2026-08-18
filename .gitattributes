@@ -1,0 +1,21 @@
+# Force LF on everything that runs inside the Linux container.
+#
+# Without this, cloning on Windows with core.autocrlf=true rewrites these files
+# with CRLF, and the container fails with "exec format error" or
+# "command not found" -- the failure the Dockerfile's `sed -i 's/\r$//'` exists
+# to paper over. This stops it at the source.
+
+* text=auto eol=lf
+
+*.sh        text eol=lf
+*.yml       text eol=lf
+*.yaml      text eol=lf
+*.py        text eol=lf
+dockerfile  text eol=lf
+Dockerfile  text eol=lf
+.env        text eol=lf
+
+*.png binary
+*.jpg binary
+*.gz  binary
+*.tar binary

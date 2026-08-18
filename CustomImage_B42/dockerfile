@@ -19,6 +19,7 @@ RUN sed -i 's/Components: main/Components: main contrib non-free non-free-firmwa
     git \
     netcat-traditional \
     procps \
+    jq \
     nano \
     && rm -rf /var/lib/apt/lists/*
 
@@ -42,6 +43,16 @@ RUN apt-get update && \
 # Create symlinks to ensure paths are always correct
 RUN ln -sf /usr/games/steamcmd /usr/bin/steamcmd
 
+# 4b. Install rcon-cli, used by the health check to query the player list
+ARG RCON_VERSION=0.10.3
+ARG RCON_SHA256=6962a641ebf9a5957bd0cda1b8acf3e34a23686ae709f6c6a14ac3898521a5cc
+RUN curl -fsSL -o /tmp/rcon.tar.gz \
+      "https://github.com/gorcon/rcon-cli/releases/download/v${RCON_VERSION}/rcon-${RCON_VERSION}-amd64_linux.tar.gz" && \
+    echo "${RCON_SHA256}  /tmp/rcon.tar.gz" | sha256sum -c - && \
+    tar -xzf /tmp/rcon.tar.gz -C /tmp && \
+    install -m 0755 "/tmp/rcon-${RCON_VERSION}-amd64_linux/rcon" /usr/local/bin/rcon && \
+    rm -rf /tmp/rcon.tar.gz "/tmp/rcon-${RCON_VERSION}-amd64_linux"
+
 # 5. Setup directories and permissions
 USER pzuser
 WORKDIR /home/pzuser
@@ -49,20 +60,23 @@ WORKDIR /home/pzuser
 # Create standard directories for volume mounting
 RUN mkdir -p /home/pzuser/server /home/pzuser/Zomboid
 
-# 6. Copy the entrypoint script
-COPY --chown=pzuser:pzuser start.sh /home/pzuser/start.sh
+# 6. Copy the entrypoint and health-check scripts
+COPY --chown=pzuser:pzuser start.sh healthcheck.sh /home/pzuser/
 
 # Remove Windows line endings (CRLF) to prevent 'command not found' errors
-RUN sed -i 's/\r$//' /home/pzuser/start.sh
+RUN sed -i 's/\r$//' /home/pzuser/start.sh /home/pzuser/healthcheck.sh
 
-RUN chmod +x /home/pzuser/start.sh
+RUN chmod +x /home/pzuser/start.sh /home/pzuser/healthcheck.sh
 
 # 7. Expose Ports
 EXPOSE 16261/udp 16262/udp 8766/udp 27015/tcp
 
 # 8. HEALTHCHECK
-HEALTHCHECK --interval=30s --timeout=10s --start-period=2m \
-  CMD pgrep -f "zombie.network.GameServer" > /dev/null || exit 1
+# Baseline only. docker-compose.yml overrides this with a much longer
+# start_period plus start_interval, which is what actually fixes the
+# "unhealthy during first boot" problem.
+HEALTHCHECK --interval=30s --timeout=20s --start-period=45m --retries=3 \
+  CMD ["/home/pzuser/healthcheck.sh"]
 
 STOPSIGNAL SIGTERM
 
