@@ -9,6 +9,7 @@ Build42/server_files/
 # Worlds, configs, backups and the recorded build id.
 Build42/zomboid_data/
 Build42/zomboid_data_test/
+Build42/sandbox_config/
 
 # Watcher state: recreated from the Steam API on first run.
 Build42/mod_watcher_state/*.json

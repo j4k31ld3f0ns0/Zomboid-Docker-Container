@@ -62,6 +62,23 @@ services:
       # is allowed to open the save.
       PZ_BACKUP_KEEP: "5"
 
+      # --- SANDBOX SETTINGS ---
+      # Installs the file mounted below as
+      # zomboid_data/Server/<SERVER_NAME>_SandboxVars.lua. Accepts either a
+      # single-player sandbox .cfg/.ini (converted by pzConfigConverter.py) or a
+      # ready-made SandboxVars.lua (validated, then copied verbatim).
+      #
+      # Re-applied only when the mounted file's contents change, so sandbox
+      # tweaks made through the in-game admin panel are not wiped on restart.
+      # Optional: with no file at this path the server boots on the game's
+      # default sandbox settings. Seed it deliberately by copying
+      # zomboid_data/Server/<SERVER_NAME>_SandboxVars.lua into sandbox_config/,
+      # or by dropping in a single-player .cfg.
+      PZ_SANDBOX_SOURCE: "/config/sandbox.lua"
+      # One-off override: re-install even if the source has not changed. Use it
+      # after hand-editing the live file and wanting the mounted one back.
+      # PZ_SANDBOX_FORCE: "true"
+
       # --- SERVER SETTINGS (Injects into .ini) ---
       # Add "CFG_" prefix to any setting from pzwiki.net/wiki/Server_settings
 
@@ -139,9 +156,21 @@ services:
 
     volumes:
       # The "./" syntax ensures these volumes are created in the relative directory
-      # where this docker-compose.yml is located.
+      # where this docker-compose.yml is located. If these paths do not already
+      # exist, Docker creates them as root and the non-root container cannot
+      # write to them; start.sh stops with the chown to run. See the README's
+      # "Permission Denied" troubleshooting entry.
       - ./zomboid_data:/home/pzuser/Zomboid
       - ./server_files:/home/pzuser/server
+      # Optional and gitignored: sandbox settings are local server config, not
+      # repo content. Read-only -- the container installs a copy, it never writes
+      # back here. The directory is mounted rather than the file: Docker creates
+      # a missing bind-mount path as an empty directory, and an empty
+      # sandbox_config/ is harmless, whereas a stray directory *named*
+      # sandbox.lua would have to be removed by hand.
+      # With no file here the server starts on the game's default sandbox
+      # settings; a file that is present but invalid stops the boot.
+      - ./sandbox_config:/config:ro
 
   mod-watcher:
     build: ./mod_watcher

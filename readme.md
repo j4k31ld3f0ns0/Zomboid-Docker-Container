@@ -74,6 +74,9 @@ docker logs -f zomboid
 | `SERVER_NAME` | Save file / config name | `servertest` |
 | `ADMIN_PASSWORD` | Default admin account password | `12345` |
 | `PZ_JVM_MEMORY` | Java heap size (e.g. `4g`, `12g`) | `4g` |
+| `PZ_JVM_EXTRA_ARGS` | Extra JVM args, space separated, appended to `vmArgs` | unset |
+| `PZ_SANDBOX_SOURCE` | Path **inside the container** to a sandbox `.cfg`/`.ini` or `SandboxVars.lua` to install. Unset disables the feature | unset |
+| `PZ_SANDBOX_FORCE` | `true` re-installs the sandbox file even if the source is unchanged | unset |
 | `HEALTH_FAIL_THRESHOLD` | Consecutive failed health checks before self-restart | `6` |
 | `SHUTDOWN_TIMEOUT` | Max seconds to wait for a save on shutdown. Keep below `stop_grace_period` | `150` |
 | `STALL_LIMIT` | Seconds of zero CPU **and** zero disk activity before declaring the server wedged | `30` |
@@ -94,6 +97,106 @@ Any variable prefixed with `CFG_` is stripped of the prefix and written into
 * `CFG_RCONPassword=...` — required for the RCON health check
 
 Full list: <https://pzwiki.net/wiki/Server_settings>
+
+### Sandbox Settings (`PZ_SANDBOX_SOURCE`)
+
+The `.ini` above is only half the configuration. The other half — zombie counts,
+loot rarity, day length, every mod's own options — lives in
+`zomboid_data/Server/<SERVER_NAME>_SandboxVars.lua`, inside a **gitignored**
+bind mount. `PZ_SANDBOX_SOURCE` is an **optional** override for it.
+
+Point it at a file mounted into the container and `start.sh` installs it on
+boot. Both shapes of input work, decided by content rather than by file
+extension:
+
+| Source | What happens |
+| :--- | :--- |
+| A ready `SandboxVars.lua` | Validated, then copied verbatim |
+| A single-player sandbox `.cfg` / `.ini` | Converted by `pzConfigConverter.py`, validated, then installed |
+
+Already wired up in `docker-compose.yml`:
+
+```yaml
+    environment:
+      PZ_SANDBOX_SOURCE: "/config/sandbox.lua"
+    volumes:
+      - ./sandbox_config:/config:ro
+```
+
+**`sandbox_config/` is gitignored and starts out empty.** Sandbox settings are
+local server config, not repo content, so nothing is shipped for you.
+
+| What is at the source path | What the server does |
+| :--- | :--- |
+| Nothing (empty `sandbox_config/`, no mount) | Starts on the game's **default** sandbox settings — or on the existing `<SERVER_NAME>_SandboxVars.lua` if there is one. Logged as a `WARNING:`. |
+| A valid `.cfg` / `.ini` / `SandboxVars.lua` | Installed as `<SERVER_NAME>_SandboxVars.lua` |
+| A file that is present but **invalid** | **The server refuses to start**, with the reason in the log |
+
+That last row is deliberate: a broken source means the server would silently run
+settings nobody chose, and for a brand-new world some of those are fixed at world
+generation.
+
+Create the directory yourself before the first `up` (`mkdir Build42/sandbox_config`):
+if Docker creates it for you it will be owned by `root`, and you will need `sudo`
+to put a file in it.
+
+**To seed it**, either copy the running server's own file:
+
+```bash
+cp Build42/zomboid_data/Server/MySurvivorServer_SandboxVars.lua Build42/sandbox_config/sandbox.lua
+```
+
+or drop in a single-player preset from `Zomboid/Sandbox Presets/*.cfg`
+(Windows: `%USERPROFILE%\Zomboid\Sandbox Presets`) and point
+`PZ_SANDBOX_SOURCE` at it — `.cfg`, `.ini` or `.lua`, the name does not matter.
+
+**When it re-applies.** The sha256 of the source is recorded in
+`zomboid_data/.pz_sandbox_source.sha256` after each successful install, and the
+file is only rewritten when that hash changes (or when the destination is
+missing, e.g. after a `SERVER_NAME` rename). That is deliberate: sandbox changes
+made in-game through the admin panel are written back to the same file, and
+re-installing on every boot would silently throw them away. To push the mounted
+file over an in-game change, set `PZ_SANDBOX_FORCE=true` for one boot.
+
+**Safety net.** The previous version is always kept as
+`<SERVER_NAME>_SandboxVars.lua.bak`, and a source that fails to validate is never
+installed — the file already on disk is left byte-for-byte intact.
+
+Check what happened with:
+
+```bash
+docker logs zomboid | grep -A5 'Applying sandbox settings'
+```
+
+### Converting a preset by hand
+
+`Build42/pzConfigConverter.py` also runs on the host if you would rather do the
+conversion yourself:
+
+```bash
+python3 Build42/pzConfigConverter.py "map_sand.cfg" MySurvivorServer
+python3 Build42/pzConfigConverter.py --check MySurvivorServer_SandboxVars.lua
+```
+
+It refuses to write a file it knows the server cannot use: a category split
+across two places in the `.cfg` (Lua would keep only the last block), a
+duplicated key, unbalanced braces, or a missing `VERSION` line. Values are typed
+as booleans, numbers or quoted strings, dotted keys become nested tables, and
+comments and blank lines are carried across so the result stays hand-editable.
+
+Values are typed from what they look like: `true`/`false` become booleans,
+numerals become numbers, everything else becomes a quoted string. A `.cfg`
+carries no type information, so to keep a numeric-looking value as *text* —
+some mods declare options like a drop rate of `.1` as a string — quote it:
+
+```ini
+PhunCure.DefDropRate=".1"     # stays the string ".1"
+PhunCure.DefDropRate=.1       # becomes the number .1
+```
+
+Known limit: an inline comment (`Zombies=4 # some note`) becomes part of the
+value, because stripping it would corrupt any legitimate value containing `#`.
+Put comments on their own line.
 
 ### A note on JVM memory
 
@@ -462,8 +565,14 @@ Test ports are offset (`16361`, `16362`, `8767`, `27016`). Join locally at
 
 ## ⚠️ Troubleshooting
 
-### "Permission Denied" errors
-Docker auto-created the data folders as `root`.
+### "Permission Denied" errors / `the container user cannot write to its volumes`
+`zomboid_data/` and `server_files/` are gitignored, so a fresh clone does not
+contain them — and Docker creates a missing bind-mount path as `root`, while the
+container runs as non-root `pzuser` (uid 1000).
+
+`start.sh` checks this before SteamCMD runs and stops with the owner of each
+unwritable path, rather than booting a server that silently has no `.ini` (no
+admin password, no RCON, default player limit). The fix:
 ```bash
 docker compose down
 sudo chown -R 1000:1000 zomboid_data server_files
@@ -510,8 +619,11 @@ Build42/
 ├── dockerfile               # Debian bookworm + SteamCMD + jq + rcon-cli
 ├── start.sh                 # entrypoint: update, validate, back up, launch, shutdown
 ├── healthcheck.sh           # three-stage health check
+├── pzConfigConverter.py     # sandbox .cfg/.ini -> SandboxVars.lua (also runs on the host)
 ├── docker-compose.yml       # production stack (pz-server + mod-watcher)
 ├── docker-compose.test.yml  # isolated test overlay
+├── sandbox_config/          # optional sandbox source, mounted read-only at
+│                            #   /config (gitignored; empty = game defaults)
 ├── mod_watcher/             # workshop update watcher (see below)
 │   ├── mod_watcher.py       # poll Steam, restart server when mods change
 │   └── probe.py             # read-only RCON/Steam/state diagnostic
