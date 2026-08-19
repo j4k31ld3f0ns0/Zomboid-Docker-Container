@@ -4,11 +4,16 @@
 !*.env.example
 
 # Game install: ~7GB, restored by SteamCMD on first boot.
-CustomImage_B42/server_files/
+Build42/server_files/
 
 # Worlds, configs, backups and the recorded build id.
-CustomImage_B42/zomboid_data/
-CustomImage_B42/zomboid_data_test/
+Build42/zomboid_data/
+Build42/zomboid_data_test/
+Build42/sandbox_config/
 
-# Runtime state
-CustomImage_B42/mod_watcher_state
+# Watcher state: recreated from the Steam API on first run.
+Build42/mod_watcher_state/*.json
+
+# Python
+__pycache__/
+*.pyc

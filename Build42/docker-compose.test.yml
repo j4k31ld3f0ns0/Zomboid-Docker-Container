@@ -5,6 +5,10 @@
 #
 # Shares ./server_files with the main stack so SteamCMD doesn't re-download 7 GB.
 # Do NOT run this at the same time as the production stack.
+#
+# "volumes: !override" below replaces the production list wholesale, so the
+# sandbox_config mount is dropped and PZ_SANDBOX_SOURCE below points at a test
+# copy instead -- keep both lines together if you change either.
 services:
   pz-server:
     container_name: zomboid-test
@@ -18,8 +22,10 @@ services:
     volumes: !override
       - ./zomboid_data_test:/home/pzuser/Zomboid
       - ./server_files:/home/pzuser/server
+      - ./sandbox_config:/config:ro
     environment:
       - SERVER_NAME=TestServer
+      - PZ_SANDBOX_SOURCE=/config/sandbox.lua
       - PZ_JVM_MEMORY=4g
       - CFG_WorkshopItems=
       - CFG_Mods=

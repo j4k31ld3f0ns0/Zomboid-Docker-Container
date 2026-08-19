@@ -21,7 +21,7 @@ RUN sed -i 's/Components: main/Components: main contrib non-free non-free-firmwa
     procps \
     jq \
     nano \
-    jq \
+    python3-minimal \
     && rm -rf /var/lib/apt/lists/*
 
 # 2. Configure Locale
@@ -61,13 +61,13 @@ WORKDIR /home/pzuser
 # Create standard directories for volume mounting
 RUN mkdir -p /home/pzuser/server /home/pzuser/Zomboid
 
-# 6. Copy the entrypoint and health-check scripts
-COPY --chown=pzuser:pzuser start.sh healthcheck.sh /home/pzuser/
+# 6. Copy the entrypoint, health-check and sandbox-converter scripts
+COPY --chown=pzuser:pzuser start.sh healthcheck.sh pzConfigConverter.py /home/pzuser/
 
 # Remove Windows line endings (CRLF) to prevent 'command not found' errors
-RUN sed -i 's/\r$//' /home/pzuser/start.sh /home/pzuser/healthcheck.sh
+RUN sed -i 's/\r$//' /home/pzuser/start.sh /home/pzuser/healthcheck.sh /home/pzuser/pzConfigConverter.py
 
-RUN chmod +x /home/pzuser/start.sh /home/pzuser/healthcheck.sh
+RUN chmod +x /home/pzuser/start.sh /home/pzuser/healthcheck.sh /home/pzuser/pzConfigConverter.py
 
 # 7. Expose Ports
 EXPOSE 16261/udp 16262/udp 8766/udp 27015/tcp

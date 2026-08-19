@@ -9,6 +9,9 @@ COPY mod_watcher.py .
 # Read-only diagnostic, run on demand:
 #   docker compose exec mod-watcher python probe.py
 COPY probe.py .
+# Branch tests for the restart algorithm, run on demand:
+#   docker compose run --rm --entrypoint python mod-watcher test_restart_logic.py
+COPY test_restart_logic.py .
 
 # Runs unprivileged: this container needs no host access at all, only outbound
 # HTTPS to the Steam API and an RCON connection to the game server.

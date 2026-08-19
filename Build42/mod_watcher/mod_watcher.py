@@ -16,6 +16,9 @@ STEAM_API_URL = "https://api.steampowered.com/ISteamRemoteStorage/GetPublishedFi
 
 SERVERDATA_AUTH = 3
 SERVERDATA_EXECCOMMAND = 2
+# Source RCON reuses the value 2 for SERVERDATA_AUTH_RESPONSE; direction is what
+# disambiguates it from SERVERDATA_EXECCOMMAND. Named separately for clarity.
+SERVERDATA_AUTH_RESPONSE = 2
 
 # PZ reports the player list as "Players connected (2):" followed by "-Name" lines.
 PLAYER_COUNT_RE = re.compile(r"connected\s*\((\d+)\)", re.IGNORECASE)
@@ -62,15 +65,30 @@ def _read_packet(sock):
     return pkt_id, pkt_type, body
 
 
+def _authenticate(sock, password):
+    """Complete the RCON handshake, leaving the stream aligned for commands.
+
+    Valve's spec has the server answer SERVERDATA_AUTH with an empty
+    SERVERDATA_RESPONSE_VALUE *and then* SERVERDATA_AUTH_RESPONSE. Reading only
+    the first packet leaves the stream off by one, so every later read returns
+    the previous reply -- and it hides a bad password, because the -1 id appears
+    only on the AUTH_RESPONSE packet that never gets read.
+    """
+    _send_packet(sock, 1, SERVERDATA_AUTH, password)
+
+    for _ in range(4):
+        pkt_id, pkt_type, _ = _read_packet(sock)
+        if pkt_type == SERVERDATA_AUTH_RESPONSE:
+            if pkt_id == -1:
+                raise PermissionError("RCON authentication failed (bad password)")
+            return
+    raise ConnectionError("No RCON auth response received from server")
+
+
 def rcon_command(host, port, password, command, timeout=10):
     with socket.create_connection((host, port), timeout=timeout) as sock:
         sock.settimeout(timeout)
-
-        _send_packet(sock, 1, SERVERDATA_AUTH, password)
-        auth_id, _, _ = _read_packet(sock)
-        if auth_id == -1:
-            raise PermissionError("RCON authentication failed (bad password)")
-
+        _authenticate(sock, password)
         _send_packet(sock, 2, SERVERDATA_EXECCOMMAND, command)
         _, _, body = _read_packet(sock)
         return body

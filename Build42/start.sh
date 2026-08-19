@@ -35,6 +35,17 @@ world_exists() {
     [ -d "$DATA_DIR/Saves" ] && [ -n "$(ls -A "$DATA_DIR/Saves" 2>/dev/null)" ]
 }
 
+# Can the container user actually create and write files here? The mkdir is part
+# of the test, not setup: creating a subdirectory is the first thing that fails
+# when Docker has created the bind-mount path as root.
+dir_is_writable() {
+    mkdir -p "$1" 2>/dev/null || return 1
+    probe="$1/.pz_write_test"
+    touch "$probe" 2>/dev/null || return 1
+    rm -f "$probe"
+    return 0
+}
+
 # Snapshot Saves (the world) and Server (ini / sandbox / spawn config).
 backup_world() {
     from="$1"
@@ -73,9 +84,44 @@ rm -rf /tmp/pz
 mkdir -p /tmp/pz
 
 # 2. Setup Directories & Ensure Permissions
-# Force creation and ensure the container user owns them
-mkdir -p "$INSTALL_DIR" "$DATA_DIR"
+# Force creation and ensure the container user owns them.
+# NOTE: this chown is a no-op in normal operation and must not be mistaken for
+# the safety net -- start.sh is PID 1 running as pzuser, and only root may chown
+# a root-owned directory. It is kept only for the case where the image is run
+# with "--user root". What actually protects the boot is the check below.
+mkdir -p "$INSTALL_DIR" "$DATA_DIR" 2>/dev/null
 chown -R pzuser:pzuser "$INSTALL_DIR" "$DATA_DIR" 2>/dev/null || true
+
+# 2b. Refuse to boot into unwritable volumes.
+# ./zomboid_data and ./server_files are gitignored, so a fresh clone does not
+# contain them -- and Docker creates a missing bind-mount path as ROOT while this
+# container deliberately runs as a non-root user. Every write then fails.
+#
+# Without this check the boot continues anyway: the .ini is never created, so the
+# server comes up with default max players, no admin password, no RCON, and a
+# health check that can never pass. A container that stops with an actionable
+# message beats a server that is silently misconfigured.
+unwritable=""
+for d in "$DATA_DIR" "$INSTALL_DIR"; do
+    dir_is_writable "$d" || unwritable="$unwritable $d"
+done
+
+if [ -n "$unwritable" ]; then
+    echo "ERROR: the container user cannot write to its volumes."
+    echo "           container user: $(id -un 2>/dev/null || id -u) (uid $(id -u), gid $(id -g))"
+    for d in $unwritable; do
+        echo "           not writable  : $d -- owned by $(stat -c '%U:%G (uid %u)' "$d" 2>/dev/null || echo 'unknown')"
+    done
+    echo "       Docker creates a missing bind-mount path as root, and this image"
+    echo "       deliberately runs as a non-root user, so a directory that did not"
+    echo "       exist before the first \"docker compose up\" is unusable."
+    echo "       Fix on the host, from the folder holding docker-compose.yml:"
+    echo "           sudo chown -R $(id -u):$(id -g) ./zomboid_data ./server_files"
+    echo "       Then bring the stack back up: docker compose up -d"
+    echo "       Backing off 30s so the restart policy does not spin."
+    sleep 30
+    exit 1
+fi
 
 echo "--- Checking for Project Zomboid Updates ---"
 
@@ -186,6 +232,141 @@ env | grep '^CFG_' | while read -r line ; do
     fi
 done
 
+# 4b. Sandbox settings: install <SERVER_NAME>_SandboxVars.lua from a mounted file.
+# PZ keeps its configuration in two halves: the .ini above, and the sandbox file
+# that actually defines the world (zombie counts, loot, time). The sandbox half
+# lives in the gitignored zomboid_data mount, so without this it exists only as a
+# file someone made by hand -- nothing about it survives a fresh clone.
+#
+# PZ_SANDBOX_SOURCE names a file mounted into the container: either a
+# single-player sandbox .cfg/.ini, which is converted, or an already-formed
+# SandboxVars.lua, which is validated and copied. Unset means "do nothing".
+SANDBOX_FILE="$DATA_DIR/Server/${SERVER_NAME}_SandboxVars.lua"
+# Hash of the source as of the last successful install. Same reasoning as
+# MANAGED_ARGS_FILE below: the destination is a persisted bind mount, so without
+# a marker this would have to either clobber the file on every boot -- throwing
+# away sandbox changes made through the in-game admin panel -- or never update it.
+SANDBOX_STATE="$DATA_DIR/.pz_sandbox_source.sha256"
+CONVERTER="/home/pzuser/pzConfigConverter.py"
+
+install_sandbox_config() {
+    src="$1"
+
+    # Two different situations, deliberately given different exit codes:
+    #   1 = nothing was provided  -> boot on the defaults, that is a valid choice
+    #   2 = something was provided and it is unusable -> refuse to boot, because
+    #       the alternative is a server silently running the wrong settings.
+    if [ ! -e "$src" ]; then
+        echo "    no sandbox source at $src."
+        return 1
+    fi
+    if [ -d "$src" ]; then
+        echo "    $src is a directory, so no sandbox source was provided."
+        echo "    (Docker creates a missing bind-mount path as an empty directory."
+        echo "     If you meant to supply a file, remove that stray directory on"
+        echo "     the host first, then put the file there.)"
+        return 1
+    fi
+    if [ ! -f "$src" ]; then
+        echo "WARNING: $src is not a regular file."
+        return 2
+    fi
+    if [ ! -r "$src" ]; then
+        echo "WARNING: $src is not readable by $(id -un 2>/dev/null || id -u) (uid $(id -u))."
+        return 2
+    fi
+
+    want="$(sha256sum "$src" | cut -d' ' -f1)"
+    have="$(cat "$SANDBOX_STATE" 2>/dev/null)"
+
+    # The -f test is what makes a SERVER_NAME rename re-apply: the source has not
+    # changed, but the file it belongs in is a different one now.
+    if [ "$want" = "$have" ] && [ -f "$SANDBOX_FILE" ] && [ "$PZ_SANDBOX_FORCE" != "true" ]; then
+        echo "    source unchanged since the last install; leaving the live file alone."
+        echo "    (set PZ_SANDBOX_FORCE=true to re-apply it anyway)"
+        return 0
+    fi
+
+    tmp_file="$(mktemp)" || return 2
+
+    # Decided by content, not by extension: the mount can be named anything, and
+    # a .cfg that is already Lua is a likelier mistake than a .lua that is not.
+    if grep -qE '^[[:space:]]*SandboxVars[[:space:]]*=' "$src"; then
+        echo "    source is already Lua; validating and copying it verbatim."
+        if converter_out="$(python3 "$CONVERTER" --check "$src" 2>&1)"; then
+            cp "$src" "$tmp_file" || { rm -f "$tmp_file"; return 2; }
+        else
+            echo "$converter_out" | sed 's/^/    /'
+            rm -f "$tmp_file"
+            return 2
+        fi
+    else
+        echo "    source is a .cfg/.ini preset; converting it to Lua."
+        if ! converter_out="$(python3 "$CONVERTER" "$src" --output "$tmp_file" 2>&1)"; then
+            echo "$converter_out" | sed 's/^/    /'
+            rm -f "$tmp_file"
+            return 2
+        fi
+    fi
+    [ -n "$converter_out" ] && echo "$converter_out" | sed 's/^/    /'
+
+    # One rollback slot, not a history: backup_world above already archives the
+    # whole Server/ directory whenever the game build changes.
+    if [ -f "$SANDBOX_FILE" ]; then
+        if cp "$SANDBOX_FILE" "${SANDBOX_FILE}.bak"; then
+            echo "    previous version saved as $(basename "$SANDBOX_FILE").bak"
+        else
+            echo "WARNING: could not write ${SANDBOX_FILE}.bak; continuing anyway."
+        fi
+    fi
+
+    if ! mv "$tmp_file" "$SANDBOX_FILE"; then
+        echo "WARNING: could not write $SANDBOX_FILE."
+        rm -f "$tmp_file"
+        return 2
+    fi
+    chmod 644 "$SANDBOX_FILE" 2>/dev/null || true   # mktemp makes it 0600
+
+    # Written only after the move lands, so the marker can never claim to
+    # describe a file that was not actually installed.
+    printf '%s' "$want" > "$SANDBOX_STATE"
+    echo "    installed $(basename "$SANDBOX_FILE")"
+    return 0
+}
+
+if [ -n "$PZ_SANDBOX_SOURCE" ]; then
+    echo "--- Configuration: Applying sandbox settings from PZ_SANDBOX_SOURCE ---"
+    echo "    source      : $PZ_SANDBOX_SOURCE"
+    echo "    destination : $SANDBOX_FILE"
+
+    # Absence and breakage are not the same thing. Providing no source is how you
+    # ask for stock settings, so that boots. A source that is present but cannot
+    # be used is a mistake, and booting anyway would run the server on settings
+    # nobody chose -- for a brand new world those are baked in at generation.
+    install_sandbox_config "$PZ_SANDBOX_SOURCE"
+    case $? in
+        0) ;;
+        1)  if [ -f "$SANDBOX_FILE" ]; then
+                echo "WARNING: no sandbox source provided; starting on the existing"
+                echo "         $(basename "$SANDBOX_FILE")."
+            else
+                echo "WARNING: no sandbox source provided; starting on the game's"
+                echo "         default sandbox settings. Drop a .cfg or a"
+                echo "         SandboxVars.lua into sandbox_config/ to change that."
+            fi
+            ;;
+        *)  echo "ERROR: PZ_SANDBOX_SOURCE names a file that cannot be used."
+            echo "       Refusing to start: the server would silently run different"
+            echo "       sandbox settings than the ones asked for. The reason is"
+            echo "       printed above."
+            echo "       Fix the file, or remove it to start on the game's defaults."
+            echo "       Backing off 30s so the restart policy does not spin."
+            sleep 30
+            exit 1
+            ;;
+    esac
+fi
+
 # 5. Configure JVM Memory & Extra Args via ProjectZomboid64.json
 JVM_CONFIG_FILE="$INSTALL_DIR/ProjectZomboid64.json"
 # Records the exact args injected on the previous boot so they can be removed
@@ -241,7 +422,7 @@ fi
 echo "--- Starting Project Zomboid Server ---"
 cd "$INSTALL_DIR" || exit
 
-# 4b. Apply the heap size where the launcher actually reads it.
+# 5b. Apply the heap size where the launcher actually reads it.
 # pzexe takes JVM args ONLY from ProjectZomboid64.json. Anything passed on the
 # command line is forwarded to the game's own arg parser, which rejects it with
 # 'unknown option "-Xmx..."' -- so the old -Xmx/-Xms flags below were silently
@@ -359,8 +540,16 @@ shutdown_server() {
 trap 'shutdown_server' SIGTERM SIGINT
 
 # 9. Wait Loop
-while kill -0 "$SERVER_PID" >/dev/null 2>&1; do
-    wait "$SERVER_PID"
+# Polls instead of using "wait". The server runs as the tail end of a pipeline
+# ("tail -f $PIPE | ./start-server.sh"), and bash's wait on a pipeline member
+# blocks until the ENTIRE job finishes. The tail feeding the command FIFO never
+# exits, so wait blocks forever even once the game process is gone -- PID 1 sits
+# in do_wait and the container never stops, so "restart: unless-stopped" never
+# fires. That is exactly what happened when mod-watcher shut the server down over
+# RCON: the game saved and exited cleanly, and nothing noticed.
+# sleep is interruptible, so the SIGTERM trap below still fires promptly.
+while kill -0 "$SERVER_PID" 2>/dev/null; do
+    sleep 5
 done
 
 # Only reached when the server exits on its own; the shutdown trap exits
