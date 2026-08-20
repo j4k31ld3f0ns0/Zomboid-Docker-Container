@@ -237,18 +237,15 @@ def check_state(cfg, timestamps):
     path = cfg["state_file"]
     directory = os.path.dirname(path)
 
-    write_test = os.path.join(directory, ".probe_write_test")
-    try:
-        os.makedirs(directory, exist_ok=True)
-        with open(write_test, "w") as handle:
-            handle.write("probe")
-        os.unlink(write_test)
-        report(PASS, f"{directory} is writable")
-    except OSError as exc:
+    exc = mw.state_dir_error(path)
+    if exc is not None:
         report(FAIL, f"{directory} is not writable by this container",
-               f"{exc}\nsave_state() would throw every cycle and the baseline would never\n"
-               "persist. Usually a root-owned ./mod_watcher_state bind mount vs UID 1000.")
+               f"{exc}\nThe watcher now refuses to start on this, so the\n"
+               "container will be crash-looping. Usually a root-owned\n"
+               "./mod_watcher_state bind mount vs UID 1000; fix with\n"
+               "    sudo chown -R 1000:1000 ./mod_watcher_state")
         return
+    report(PASS, f"{directory} is writable")
 
     try:
         state = mw.load_state(path)

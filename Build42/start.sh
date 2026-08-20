@@ -368,6 +368,12 @@ if [ -n "$PZ_SANDBOX_SOURCE" ]; then
 fi
 
 # 5. Configure JVM Memory & Extra Args via ProjectZomboid64.json
+# pzexe takes JVM args ONLY from ProjectZomboid64.json. Anything passed on the
+# command line is forwarded to the game's own arg parser, which rejects it with
+# 'unknown option "-Xmx..."' -- so command-line -Xmx/-Xms flags silently do
+# nothing and the server runs on the json's stock 8g. SteamCMD's "validate"
+# rewrites this file on every boot, so it must be re-patched here each time
+# rather than edited by hand.
 JVM_CONFIG_FILE="$INSTALL_DIR/ProjectZomboid64.json"
 # Records the exact args injected on the previous boot so they can be removed
 # before re-injecting. ./server_files is a persisted bind mount, so without this
@@ -375,76 +381,65 @@ JVM_CONFIG_FILE="$INSTALL_DIR/ProjectZomboid64.json"
 MANAGED_ARGS_FILE="$INSTALL_DIR/.pz_managed_vmargs.json"
 PZ_JVM_MEMORY="${PZ_JVM_MEMORY:-4g}"
 
-if [ -f "$JVM_CONFIG_FILE" ]; then
-    echo "--- Configuration: Applying PZ_JVM_MEMORY and PZ_JVM_EXTRA_ARGS to ProjectZomboid64.json ---"
+# Fatal rather than skippable, both here and on a jq failure below. Continuing
+# means booting on the stock 8g heap with no sign anything went wrong, and
+# install_is_complete() already requires this file -- so if it is missing after a
+# successful SteamCMD run, the install is broken rather than merely unpatched.
+if [ ! -f "$JVM_CONFIG_FILE" ]; then
+    echo "ERROR: $JVM_CONFIG_FILE not found after a successful update."
+    echo "       The heap size can only be set here, so continuing would run the"
+    echo "       server on the launcher's stock heap. This means a broken install."
+    echo "       Backing off 30s so the restart policy does not spin."
+    sleep 30
+    exit 1
+fi
 
-    # Build a JSON array from the space-separated PZ_JVM_EXTRA_ARGS env var (if any)
-    extra_args_json="[]"
-    if [ -n "$PZ_JVM_EXTRA_ARGS" ]; then
-        extra_args_json=$(printf '%s\n' $PZ_JVM_EXTRA_ARGS | jq -R . | jq -s .)
-    fi
+echo "--- Setting JVM heap to $PZ_JVM_MEMORY in ProjectZomboid64.json ---"
 
-    prev_managed_json="[]"
-    if [ -f "$MANAGED_ARGS_FILE" ] && jq -e . "$MANAGED_ARGS_FILE" >/dev/null 2>&1; then
-        prev_managed_json=$(cat "$MANAGED_ARGS_FILE")
-    fi
+# Build a JSON array from the space-separated PZ_JVM_EXTRA_ARGS env var (if any)
+extra_args_json="[]"
+if [ -n "$PZ_JVM_EXTRA_ARGS" ]; then
+    extra_args_json=$(printf '%s\n' $PZ_JVM_EXTRA_ARGS | jq -R . | jq -s .)
+fi
 
-    # -Xmx/-Xms are stripped by prefix; everything else we added is stripped by
-    # exact match against $prev. The "map(. as $a | ...)" binding is required -
-    # inside the pipe of index(), "." would refer to $prev, not the element.
-    # The closing reduce is an order-preserving dedupe: it collapses duplicates
-    # left by a missing/corrupt marker, and cleans up installs that already
-    # accumulated them before this logic existed. Exact-duplicate JVM args are
-    # always redundant, and keeping the first occurrence preserves stock order.
-    tmp_file=$(mktemp)
-    if jq --arg mem "$PZ_JVM_MEMORY" \
-          --argjson extra "$extra_args_json" \
-          --argjson prev "$prev_managed_json" '
-        .vmArgs = ((.vmArgs // [])
-                    | map(select((startswith("-Xmx") or startswith("-Xms")) | not))
-                    | map(. as $a | select(($prev | index($a)) == null)))
-                  + ["-Xmx\($mem)", "-Xms\($mem)"]
-                  + $extra
-        | .vmArgs |= reduce .[] as $a ([]; if index($a) == null then . + [$a] else . end)
-    ' "$JVM_CONFIG_FILE" > "$tmp_file"; then
-        mv "$tmp_file" "$JVM_CONFIG_FILE"
-        # Written only after the rewrite lands, so the marker never claims to
-        # describe args that aren't actually in the file.
-        printf '%s' "$extra_args_json" > "$MANAGED_ARGS_FILE"
-    else
-        echo "WARNING: Failed to rewrite $JVM_CONFIG_FILE; leaving it unchanged."
-        rm -f "$tmp_file"
-    fi
+prev_managed_json="[]"
+if [ -f "$MANAGED_ARGS_FILE" ] && jq -e . "$MANAGED_ARGS_FILE" >/dev/null 2>&1; then
+    prev_managed_json=$(cat "$MANAGED_ARGS_FILE")
+fi
+
+# -Xmx/-Xms are stripped by prefix; everything else we added is stripped by
+# exact match against $prev. The "map(. as $a | ...)" binding is required -
+# inside the pipe of index(), "." would refer to $prev, not the element.
+# The closing reduce is an order-preserving dedupe: it collapses duplicates
+# left by a missing/corrupt marker, and cleans up installs that already
+# accumulated them before this logic existed. Exact-duplicate JVM args are
+# always redundant, and keeping the first occurrence preserves stock order.
+tmp_file=$(mktemp)
+if jq --arg mem "$PZ_JVM_MEMORY" \
+      --argjson extra "$extra_args_json" \
+      --argjson prev "$prev_managed_json" '
+    .vmArgs = ((.vmArgs // [])
+                | map(select((startswith("-Xmx") or startswith("-Xms")) | not))
+                | map(. as $a | select(($prev | index($a)) == null)))
+              + ["-Xmx\($mem)", "-Xms\($mem)"]
+              + $extra
+    | .vmArgs |= reduce .[] as $a ([]; if index($a) == null then . + [$a] else . end)
+' "$JVM_CONFIG_FILE" > "$tmp_file" && [ -s "$tmp_file" ]; then
+    mv "$tmp_file" "$JVM_CONFIG_FILE"
+    # Written only after the rewrite lands, so the marker never claims to
+    # describe args that aren't actually in the file.
+    printf '%s' "$extra_args_json" > "$MANAGED_ARGS_FILE"
 else
-    echo "WARNING: $JVM_CONFIG_FILE not found; skipping JVM memory/args injection."
+    rm -f "$tmp_file"
+    echo "ERROR: could not set the heap size in $JVM_CONFIG_FILE."
+    echo "       The launcher's config format may have changed in this build."
+    echo "       Backing off 30s so the restart policy does not spin."
+    sleep 30
+    exit 1
 fi
 
 echo "--- Starting Project Zomboid Server ---"
 cd "$INSTALL_DIR" || exit
-
-# 5b. Apply the heap size where the launcher actually reads it.
-# pzexe takes JVM args ONLY from ProjectZomboid64.json. Anything passed on the
-# command line is forwarded to the game's own arg parser, which rejects it with
-# 'unknown option "-Xmx..."' -- so the old -Xmx/-Xms flags below were silently
-# doing nothing and the server ran on the json's stock 8g. SteamCMD's "validate"
-# rewrites this file on every boot, so it must be re-patched here each time
-# rather than edited by hand.
-LAUNCHER_JSON="$INSTALL_DIR/ProjectZomboid64.json"
-echo "--- Setting JVM heap to $PZ_JVM_MEMORY in ProjectZomboid64.json ---"
-TMP_JSON="$(mktemp)"
-if jq --arg mem "$PZ_JVM_MEMORY" '
-        .vmArgs = ((.vmArgs // [])
-            | map(select((startswith("-Xmx") or startswith("-Xms")) | not))
-            + ["-Xmx" + $mem, "-Xms" + $mem])
-    ' "$LAUNCHER_JSON" > "$TMP_JSON" && [ -s "$TMP_JSON" ]; then
-    cat "$TMP_JSON" > "$LAUNCHER_JSON"
-    rm -f "$TMP_JSON"
-else
-    rm -f "$TMP_JSON"
-    echo "ERROR: could not set the heap size in $LAUNCHER_JSON."
-    echo "       The launcher's config format may have changed in this build."
-    exit 1
-fi
 
 # 5. Start Server in Background with Pipe Input
 tail -f "$PIPE" | ./start-server.sh \

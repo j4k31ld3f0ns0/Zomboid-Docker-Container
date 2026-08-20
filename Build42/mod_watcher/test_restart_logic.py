@@ -8,7 +8,7 @@ RCON to be broken in a specific way. This serves a scripted sequence of player
 counts instead, so every branch runs deterministically in seconds against the
 real mod_watcher code.
 
-  docker compose run --rm --entrypoint python mod-watcher test_restart_logic.py
+  docker compose run --rm --no-deps --entrypoint python mod-watcher test_restart_logic.py
 """
 import socket, struct, threading, time, logging, sys
 import mod_watcher as mw
