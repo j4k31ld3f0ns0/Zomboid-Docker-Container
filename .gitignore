@@ -1,4 +1,4 @@
-# Secrets. .env holds ADMIN_PASSWORD / CFG_PASSWORD / RCON_PASSWORD.
+# Secrets. .env holds ADMIN_PASSWORD / SERVER_PASSWORD / RCON_PASSWORD.
 .env
 *.env
 !*.env.example

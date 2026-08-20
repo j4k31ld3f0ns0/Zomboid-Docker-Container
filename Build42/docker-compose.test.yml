@@ -1,10 +1,13 @@
-# Test overlay: isolated world, isolated ports, small heap, no mods.
+# Test overlay: isolated world, isolated ports, small heap, no mods, no watcher.
 # Usage:
 #   docker compose -f docker-compose.yml -f docker-compose.test.yml -p zomboid-test up -d --build
 #   docker compose -p zomboid-test down
 #
 # Shares ./server_files with the main stack so SteamCMD doesn't re-download 7 GB.
 # Do NOT run this at the same time as the production stack.
+#
+# Still reads ./.env: the overlay does not touch pz-server's env_file, so
+# ADMIN_PASSWORD / SERVER_PASSWORD / RCON_PASSWORD must be set as usual.
 #
 # "volumes: !override" below replaces the production list wholesale, so the
 # sandbox_config mount is dropped and PZ_SANDBOX_SOURCE below points at a test
@@ -32,3 +35,13 @@ services:
       - CFG_Map=Muldraugh, KY
       - CFG_MaxPlayers=4
       - CFG_Public=false
+
+  # The test stack exercises the game server, not the watcher. Left enabled it
+  # would collide with the production container on container_name, inherit the
+  # full production WORKSHOP_ITEMS, and resolve RCON_HOST "pz-server" to the TEST
+  # server -- which it can RCON-quit mid-test. The base file sets no profiles, so
+  # naming one here keeps this service out of "up" without affecting production.
+  # To run it anyway: add --profile watcher.
+  mod-watcher:
+    container_name: pz-mod-watcher-test
+    profiles: ["watcher"]

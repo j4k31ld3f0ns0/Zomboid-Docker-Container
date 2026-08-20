@@ -17,7 +17,8 @@ services:
 
     # [CRITICAL SHUTDOWN SETTING]
     # Docker normally kills a container after 10 seconds if it doesn't stop.
-    # PZ needs time to save the map to disk. 120s prevents world corruption.
+    # PZ needs time to save the map to disk. 180s prevents world corruption,
+    # and must stay above the SHUTDOWN_TIMEOUT set below.
     stop_grace_period: 180s
 
     # [HEALTH CHECK]
@@ -98,21 +99,16 @@ services:
       # DROPPED 2026-08-18: NutritionMakesSense / workshop 3690404044.
       # Its SmashPumpkin recipe override collides with vanilla and hard-fails
       # world load: "java.io.IOException: Duplicate Prop1 in recipe SmashPumpkin".
-      # Mod-side regression published 2026-08-18 10:22 UTC; deleting and
-      # Confirmed against a fully wiped workshop tree: all 58 mods re-downloaded
-      # from scratch (505MB) and it crashed identically, so it is not bad local
-      # content. Steam shows the build unchanged since it was published.
-      # To restore: re-add 3690404044 to the list below.
+      # Mod-side regression published 2026-08-18 10:22 UTC. Confirmed against a
+      # fully wiped workshop tree: all 58 mods re-downloaded from scratch (505MB)
+      # and it crashed identically, so it is not bad local content. Steam shows
+      # the build unchanged since it was published.
+      # To restore: re-add workshop id 3690404044 here AND the mod id
+      # NutritionMakesSense to CFG_Mods below -- both are needed.
       CFG_WorkshopItems: *workshop_items
 
-      # DROPPED 2026-08-18: NutritionMakesSense / workshop 3690404044.
-      # Its SmashPumpkin recipe override collides with vanilla and hard-fails
-      # world load: "java.io.IOException: Duplicate Prop1 in recipe SmashPumpkin".
-      # Mod-side regression published 2026-08-18 10:22 UTC; deleting and
-      # Confirmed against a fully wiped workshop tree: all 58 mods re-downloaded
-      # from scratch (505MB) and it crashed identically, so it is not bad local
-      # content. Steam shows the build unchanged since it was published.
-      # To restore: re-add NutritionMakesSense to the list below.
+      # NutritionMakesSense was dropped here on 2026-08-18 alongside its workshop
+      # id; see the note on CFG_WorkshopItems above for why and how to restore it.
       CFG_Mods: "ChuckleberryFinnAlertSystem;errorMagnifier;PROJECTRVInterior42;CVI;damnlib;78amgeneralM35A2;82oshkoshM911;84merc;88toyotaHilux;92amgeneralM998;92amgeneralM998extra;78amgeneralM35A2extra;97bushmaster;RebalancedPropMoving;ArmorMakesSense;better-auto-mechanics;KI5campers;CleanHotBar;NeatUI_Framework;CleanUI;VB_CommonSense;isoContainers;EQUIPMENT_UI;FWOFitnessWorkoutOverhaul;FWOBenchPress&Treadmill;HereGoesTheSun;HBVCEFb42;HBAC;SWMG;ImmersiveBlackouts;ImmersiveReading;ImmersiveSearching;stanks_suicide;InjuredZombiesStumble;JB_BugsInLights;JumboTreeIndoorFix;YAPZLib;KI5minifixes;ZomboidDrugzz;MoreDamagedObjects;DG_MIVehicles;phuncure2;RealisticDash;SkillRecoveryJournal;SpawnSelector;SpecLoot;StarvingZombies;SwapIt;ThumpingAttractsZombies;TopplingZombies;KI5trailers;TrippingZombies;VanillaVehiclesAnimated;MarzVanillaGuns;VMZNEW;VSUIKI5;dustinguished_bolt_cutters;HelicopterEventExpansionFramework;WanderingZombiesWIP"
 
 
@@ -141,7 +137,7 @@ services:
       CFG_Public: "false"
       CFG_PublicName: "omg a zomboid server"
       CFG_PublicDescription: "nvvy and gods gift to gaming manages this"
-      CFG_Password: "${CFG_PASSWORD}"
+      CFG_Password: "${SERVER_PASSWORD}"
 
       # [Protection]
       #- CFG_DoLuaChecksum=true    # Kick players with mismatched mods
@@ -180,17 +176,11 @@ services:
       - pz-server
     # Deliberately no "env_file": the watcher only needs RCON_PASSWORD, which is
     # interpolated from ./.env below. Loading the whole file would also hand it
-    # ADMIN_PASSWORD and CFG_PASSWORD for no reason.
+    # ADMIN_PASSWORD and SERVER_PASSWORD for no reason.
     environment:
       # Same anchor pz-server uses, so this is the identical list by construction.
-      # DROPPED 2026-08-18: NutritionMakesSense / workshop 3690404044.
-      # Its SmashPumpkin recipe override collides with vanilla and hard-fails
-      # world load: "java.io.IOException: Duplicate Prop1 in recipe SmashPumpkin".
-      # Mod-side regression published 2026-08-18 10:22 UTC; deleting and
-      # Confirmed against a fully wiped workshop tree: all 58 mods re-downloaded
-      # from scratch (505MB) and it crashed identically, so it is not bad local
-      # content. Steam shows the build unchanged since it was published.
-      # To restore: re-add 3690404044 to the list below.
+      # NutritionMakesSense / workshop 3690404044 was dropped on 2026-08-18; see
+      # the note on pz-server's CFG_WorkshopItems above.
       WORKSHOP_ITEMS: *workshop_items
       # How often to poll the Steam Workshop API for updates (seconds)
       POLL_INTERVAL_SECONDS: "600"
