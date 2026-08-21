@@ -1,7 +1,11 @@
-# Secrets. .env holds ADMIN_PASSWORD / CFG_PASSWORD / RCON_PASSWORD.
+# Secrets. .env holds ADMIN_PASSWORD / SERVER_PASSWORD / RCON_PASSWORD.
 .env
 *.env
 !*.env.example
+
+# Local compose config. Copy docker-compose.example.yml to docker-compose.yml
+# and edit it; your copy is never overwritten by a pull. Same idea as .env above.
+Build42/docker-compose.yml
 
 # Game install: ~7GB, restored by SteamCMD on first boot.
 Build42/server_files/

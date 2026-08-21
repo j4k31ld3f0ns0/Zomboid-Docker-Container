@@ -1,0 +1,229 @@
+# TEMPLATE -- copy this to docker-compose.yml before your first boot:
+#
+#     cp docker-compose.example.yml docker-compose.yml
+#
+# docker-compose.yml is gitignored, so your copy is yours: edit it freely and a
+# "git pull" will never overwrite it. Same arrangement as .env / .env.example.
+#
+# Values marked REPLACE are placeholders and will not run a server you want.
+# At minimum, work through the mod lists below and SERVER_NAME.
+
+# Single source of truth for the Workshop list. pz-server and mod-watcher both
+# alias this, so the two can no longer drift apart -- previously each held its
+# own copy with a comment asking you to keep them identical by hand.
+# YAML aliases substitute whole nodes, not fragments of a string, which is why
+# both environment blocks are mappings rather than "- KEY=value" lists.
+#
+# REPLACE: these are the placeholder ids from the README's "Adding Mods"
+# section. Put your own Workshop ids here, separated by ";". Do not leave this
+# empty -- mod-watcher exits at startup with nothing to watch, and its
+# "restart: unless-stopped" policy would then restart it forever.
+x-workshop-items: &workshop_items "2611652230;2611652231"
+
+services:
+  pz-server:
+    # CHANGE: Replace "build: ." with "image:" pointing to your uploaded container
+    build: .
+    # image: your_username/project-zomboid-server:latest
+    env_file:
+    - ./.env
+    container_name: zomboid
+    restart: unless-stopped
+
+    # [CRITICAL SHUTDOWN SETTING]
+    # Docker normally kills a container after 10 seconds if it doesn't stop.
+    # PZ needs time to save the map to disk. 180s prevents world corruption,
+    # and must stay above the SHUTDOWN_TIMEOUT set below.
+    stop_grace_period: 180s
+
+    # [HEALTH CHECK]
+    # start_period is deliberately huge: on a cold volume SteamCMD pulls ~7GB
+    # and then the workshop mods before the game process even exists. While the
+    # start period is running a failing check reports "starting", never
+    # "unhealthy", and does not burn retries.
+    #
+    # start_interval (Docker 25+/API 1.44+) is what makes that free: during the
+    # start period the check runs every 10s instead of every 30s, and the first
+    # success ends the period immediately. So a warm restart still flips to
+    # healthy seconds after the server finishes loading, and only a genuinely
+    # broken cold boot sits in "starting" for the full 45m.
+    healthcheck:
+      test: ["CMD", "/home/pzuser/healthcheck.sh"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+      start_period: 45m
+      start_interval: 10s
+
+    ports:
+      - "16261:16261/udp"
+      - "16262:16262/udp"
+      - "8766:8766/udp" #this port is required for steam to work.
+      - "27015:27015/tcp"
+    environment:
+      # Names the save folder and the .ini, so changing it later starts a new
+      # world rather than renaming the old one.
+      SERVER_NAME: "MySurvivorServer"
+      ADMIN_PASSWORD: "${ADMIN_PASSWORD}"
+      # Sets -Xmx/-Xms in server_files/ProjectZomboid64.json (vmArgs).
+      # Budget this plus ~2GB overhead of host RAM.
+      PZ_JVM_MEMORY: "12g"
+
+      # Consecutive failed health checks (30s apart) before the container
+      # restarts itself. Only counted after the server has answered RCON at
+      # least once, so a slow first boot can never trigger it. 6 x 30s = 3min,
+      # long enough to ride out a long autosave without a false restart.
+      HEALTH_FAIL_THRESHOLD: "6"
+      # Must stay below stop_grace_period above.
+      SHUTDOWN_TIMEOUT: "150"
+      # Pre-update world backups kept in ./zomboid_data/backups. A backup is
+      # taken only when SteamCMD pulls a new build id, before the new binary
+      # is allowed to open the save.
+      PZ_BACKUP_KEEP: "5"
+
+      # --- SANDBOX SETTINGS ---
+      # Installs the file mounted below as
+      # zomboid_data/Server/<SERVER_NAME>_SandboxVars.lua. Accepts either a
+      # single-player sandbox .cfg/.ini (converted by pzConfigConverter.py) or a
+      # ready-made SandboxVars.lua (validated, then copied verbatim).
+      #
+      # Re-applied only when the mounted file's contents change, so sandbox
+      # tweaks made through the in-game admin panel are not wiped on restart.
+      # Optional: with no file at this path the server boots on the game's
+      # default sandbox settings. Seed it deliberately by copying
+      # zomboid_data/Server/<SERVER_NAME>_SandboxVars.lua into sandbox_config/,
+      # or by dropping in a single-player .cfg.
+      PZ_SANDBOX_SOURCE: "/config/sandbox.lua"
+      # One-off override: re-install even if the source has not changed. Use it
+      # after hand-editing the live file and wanting the mounted one back.
+      # PZ_SANDBOX_FORCE: "true"
+
+      # --- SERVER SETTINGS (Injects into .ini) ---
+      # Add "CFG_" prefix to any setting from pzwiki.net/wiki/Server_settings
+
+      # [Player Settings]
+      CFG_MaxPlayers: "16"
+      CFG_PVP: "true"
+      CFG_GlobalChat: "true"
+      CFG_DisplayUserName: "true"
+      # Show skull icon for PVP status
+      CFG_ShowSafety: "true"
+
+      # [Mods]
+      # Two separate lists, and they are not interchangeable:
+      #   CFG_WorkshopItems -- Workshop ids, what SteamCMD downloads. Aliased
+      #                        from x-workshop-items at the top of this file, so
+      #                        mod-watcher reads the identical list and the two
+      #                        cannot drift. Edit the anchor, never this line.
+      #   CFG_Mods          -- mod ids, the load order. Separate because one
+      #                        Workshop item can ship several mods.
+      # See the README's "Adding Mods (Steam Workshop)" section.
+      CFG_WorkshopItems: *workshop_items
+      # REPLACE: placeholder mod ids. These must be the mod ids shipped by the
+      # Workshop items above -- a mod id listed here that was never downloaded
+      # stops the world loading.
+      CFG_Mods: "ModManager;AnotherModName"
+
+      # [Loot & World]
+      # - CFG_HoursForLootRespawn=4383 # 0 = Never, 24 = Every day
+      # - CFG_MaxItemsForLootRespawn=4
+      # - CFG_ConstructionPreventsLootRespawn=true
+
+      # Vanilla map. Adding a Workshop map means listing it here *before*
+      # "Muldraugh, KY", plus its Workshop id and mod id in the two lists above.
+      CFG_Map: "Muldraugh, KY"
+      # This fixes the mod mismatch issues
+      CFG_DoLuaChecksum: "false"
+      CFG_SaveWorldEveryMinutes: "15"
+      # true stops time when the server is empty. Off here so mod-watcher's
+      # "wait for the server to empty, then restart" path is not fighting a
+      # paused world.
+      CFG_PauseEmpty: "false"
+      CFG_AntiCheatType2: "false"
+      CFG_AntiCheatType12: "false"
+
+      # [Server Visibility]
+      # Visible in Steam Server Browser
+      CFG_Public: "false"
+      # REPLACE: shown in the Steam server browser when CFG_Public is true.
+      CFG_PublicName: "My Project Zomboid Server"
+      CFG_PublicDescription: "A Build 42 dedicated server"
+      CFG_Password: "${SERVER_PASSWORD}"
+
+      # [Protection]
+      # Kick players with high ping
+      CFG_PingLimit: "400"
+
+      # [RCON]
+      CFG_RCONPort: "27015"
+      CFG_RCONPassword: "${RCON_PASSWORD}"
+
+    volumes:
+      # The "./" syntax ensures these volumes are created in the relative directory
+      # where this docker-compose.yml is located. If these paths do not already
+      # exist, Docker creates them as root and the non-root container cannot
+      # write to them; start.sh stops with the chown to run. See the README's
+      # "Permission Denied" troubleshooting entry.
+      - ./zomboid_data:/home/pzuser/Zomboid
+      - ./server_files:/home/pzuser/server
+      # Optional and gitignored: sandbox settings are local server config, not
+      # repo content. Read-only -- the container installs a copy, it never writes
+      # back here. The directory is mounted rather than the file: Docker creates
+      # a missing bind-mount path as an empty directory, and an empty
+      # sandbox_config/ is harmless, whereas a stray directory *named*
+      # sandbox.lua would have to be removed by hand.
+      # With no file here the server starts on the game's default sandbox
+      # settings; a file that is present but invalid stops the boot.
+      - ./sandbox_config:/config:ro
+
+  mod-watcher:
+    build: ./mod_watcher
+    container_name: pz-mod-watcher
+    restart: unless-stopped
+    depends_on:
+      - pz-server
+    # Deliberately no "env_file": the watcher only needs RCON_PASSWORD, which is
+    # interpolated from ./.env below. Loading the whole file would also hand it
+    # ADMIN_PASSWORD and SERVER_PASSWORD for no reason.
+    environment:
+      # Same anchor pz-server uses, so this is the identical list by construction.
+      WORKSHOP_ITEMS: *workshop_items
+      # How often to poll the Steam Workshop API for updates (seconds)
+      POLL_INTERVAL_SECONDS: "600"
+      # pz-server is the compose service name, reachable on the internal network
+      RCON_HOST: "pz-server"
+      RCON_PORT: "27015"
+      RCON_PASSWORD: "${RCON_PASSWORD}"
+
+      # --- RESTART TIMING ---
+      # On detecting an update the watcher waits for the server to empty out before
+      # restarting. If it is still occupied after MAX_RESTART_WAIT_SECONDS, it warns
+      # players and restarts anyway.
+      MAX_RESTART_WAIT_SECONDS: "3600"
+      # How often to re-check the connected player count while waiting
+      EMPTY_CHECK_INTERVAL_SECONDS: "60"
+      # Short pause after the server empties, in case someone is reconnecting
+      EMPTY_RESTART_GRACE_SECONDS: "10"
+      # Notice given to players before a forced (non-empty) restart
+      FORCED_RESTART_WARNING_SECONDS: "300"
+      # How long to wait for the RCON port to close before declaring the restart failed.
+      # Must comfortably exceed how long the server can take to save and exit, or
+      # the watcher declares a successful restart "unconfirmed", never commits the
+      # new timestamps, and restarts again on the next poll. Worst case is the
+      # health check noticing the stall (~3m40s) plus its own SHUTDOWN_TIMEOUT
+      # (150s), so 300 covers it. Costs nothing in the normal case: the port check
+      # polls every 5s and returns as soon as the port closes.
+      SHUTDOWN_TIMEOUT_SECONDS: "300"
+
+    # No Docker socket, no host access. The watcher restarts the server by sending
+    # the RCON "quit" command: the game process exits, start.sh falls through, the
+    # container stops, and pz-server's own "restart: unless-stopped" policy brings
+    # it back - which re-runs steamcmd and pulls the updated mods.
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    volumes:
+      - ./mod_watcher_state:/state

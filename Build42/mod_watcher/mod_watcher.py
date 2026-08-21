@@ -14,6 +14,16 @@ log = logging.getLogger("mod_watcher")
 
 STEAM_API_URL = "https://api.steampowered.com/ISteamRemoteStorage/GetPublishedFileDetails/v1/"
 
+UNWRITABLE_STATE_MSG = """Cannot write the state file; the mod baseline could never persist.
+    error         : %s
+    not writable  : %s -- owned by %s
+    container user: uid %d, gid %d
+Docker creates a missing bind-mount path as root, and this image deliberately
+runs as a non-root user, so a directory that did not exist before the first
+"docker compose up" is unusable. Fix on the host, from the folder holding
+docker-compose.yml:
+    sudo chown -R %d:%d ./mod_watcher_state"""
+
 SERVERDATA_AUTH = 3
 SERVERDATA_EXECCOMMAND = 2
 # Source RCON reuses the value 2 for SERVERDATA_AUTH_RESPONSE; direction is what
@@ -172,6 +182,57 @@ def save_state(path, state):
     os.replace(tmp, path)
 
 
+def state_dir_error(path):
+    """The OSError that makes `path` unwritable, or None if it can be written.
+
+    Creating and deleting a real file is the only trustworthy test. os.access()
+    consults the mode bits and gets bind mounts wrong, and the failure this
+    exists to catch -- Docker creating a missing bind-mount path as root while
+    this container runs as uid 1000 -- surfaces only on the write itself.
+    Shared with probe.py so the watcher and the diagnostic cannot disagree.
+    """
+    directory = os.path.dirname(path)
+    probe = os.path.join(directory, ".state_write_test")
+    try:
+        os.makedirs(directory, exist_ok=True)
+        with open(probe, "w") as f:
+            f.write("probe")
+        os.unlink(probe)
+    except OSError as exc:
+        return exc
+    return None
+
+
+def describe_owner(path):
+    try:
+        st = os.stat(path)
+    except OSError:
+        return "unknown"
+    return f"uid {st.st_uid}, gid {st.st_gid}"
+
+
+def preflight_state_dir(cfg):
+    """Refuse to start when the baseline could never be persisted.
+
+    save_state() failing every cycle used to look survivable: the error was
+    logged, the watcher kept polling, and nothing else complained. But the
+    baseline never committed, so first_run never cleared, so the update
+    comparison below was never reached and no mod update could ever be
+    detected -- for as long as the container stayed up. Exiting with the
+    owning uid beats running and silently doing nothing. start.sh applies the
+    same rule to the game server's volumes.
+    """
+    exc = state_dir_error(cfg["state_file"])
+    if exc is None:
+        return
+
+    directory = os.path.dirname(cfg["state_file"])
+    uid, gid = os.getuid(), os.getgid()
+    log.error(UNWRITABLE_STATE_MSG, exc, directory, describe_owner(directory),
+              uid, gid, uid, gid)
+    sys.exit(1)
+
+
 def wait_for_empty_server(cfg):
     """Block until nobody is connected. True if it emptied, False if we hit the cap.
 
@@ -271,6 +332,8 @@ def main():
         log.error("WORKSHOP_ITEMS is empty; nothing to watch. Exiting.")
         sys.exit(1)
 
+    preflight_state_dir(cfg)
+
     state = load_state(cfg["state_file"])
     first_run = not state
 
@@ -279,9 +342,14 @@ def main():
             current = fetch_mod_timestamps(cfg["mod_ids"])
             if first_run:
                 log.info("Baseline established for %d mod(s).", len(current))
-                save_state(cfg["state_file"], current)
+                # Order matters: commit in memory first. When save_state() threw
+                # before these two lines, the except below swallowed it and
+                # first_run stayed set, so every cycle re-recorded a baseline and
+                # the comparison below was dead code. Now a failed write costs
+                # the baseline only across a container restart.
                 state = current
                 first_run = False
+                save_state(cfg["state_file"], current)
             else:
                 changed = [mid for mid, ts in current.items() if str(state.get(mid)) != str(ts)]
                 if changed:

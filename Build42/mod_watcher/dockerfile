@@ -10,7 +10,7 @@ COPY mod_watcher.py .
 #   docker compose exec mod-watcher python probe.py
 COPY probe.py .
 # Branch tests for the restart algorithm, run on demand:
-#   docker compose run --rm --entrypoint python mod-watcher test_restart_logic.py
+#   docker compose run --rm --no-deps --entrypoint python mod-watcher test_restart_logic.py
 COPY test_restart_logic.py .
 
 # Runs unprivileged: this container needs no host access at all, only outbound

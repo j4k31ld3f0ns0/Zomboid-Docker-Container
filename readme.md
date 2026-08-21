@@ -20,38 +20,74 @@ A custom Docker setup for hosting a Project Zomboid **Build 42** dedicated serve
 
 ### 1. Prerequisite Checklist
 * Docker installed (25.0+ / API 1.44+ — required for `start_interval`)
-* Docker Compose installed (2.24+ — required for `!override` in the test overlay)
+* Docker Compose installed (2.24.4+ — required for `!override` in the test overlay)
 * RAM: Java heap + ~2GB overhead. The stock config asks for 12g, so ~14GB.
 
-### 2. Create the `.env` file
+### 2. Create your compose file
+
+There is no compose file at the repo root, so **every `docker compose` command
+below runs from `Build42/`.** Paths written as `Build42/...` are relative to the
+repo root; every other path is relative to `Build42/`.
+
+```bash
+cd Build42
+cp docker-compose.example.yml docker-compose.yml
+```
+
+`docker-compose.yml` is gitignored and `docker-compose.example.yml` is the
+committed template, so your edits survive a `git pull` and are never clobbered
+by one — the same arrangement as `.env` / `.env.example` below.
+
+Open it before your first boot. The template carries the full production stack
+and every explanatory comment, but the Workshop and mod ids in it are
+placeholders marked `REPLACE` — see
+[Adding Mods (Steam Workshop)](#️-adding-mods-steam-workshop).
+
+### 3. Create the `.env` file
 
 `docker-compose.yml` reads three secrets from `Build42/.env`:
 
 ```bash
-cp Build42/.env.example Build42/.env
+cp .env.example .env
 # then edit it:
 #   ADMIN_PASSWORD=...    admin account
-#   CFG_PASSWORD=...      password players type to join
+#   SERVER_PASSWORD=...   password players type to join
 #   RCON_PASSWORD=...     also used by the health check
 ```
 
 `.env` is gitignored; `.env.example` is committed as the template.
 
+> **Upgrading an existing `.env`?** `SERVER_PASSWORD` used to be called
+> `CFG_PASSWORD`. Rename that one line. The old name was wrong: `start.sh` writes
+> *every* `CFG_`-prefixed variable into the `.ini` with the prefix stripped, so it
+> added a junk `PASSWORD=` key the game never reads. The key players actually
+> authenticate against is `Password`, set separately by `CFG_Password` in
+> `docker-compose.yml` — which is what now reads `SERVER_PASSWORD`.
+
 > If `RCON_PASSWORD` is empty the health check degrades to a process-liveness
 > check and says so in its output. It will not silently pretend to be healthy.
 
-### 3. Create Required Folders & Set Permissions
+### 4. Create Required Folders & Set Permissions
 
 Because the container runs as a non-root user (UID `1000`), host directories
 must exist with the right ownership to prevent "Permission Denied" crashes.
 
 ```bash
-cd Build42
-mkdir -p zomboid_data server_files
-sudo chown -R 1000:1000 zomboid_data server_files
+mkdir -p zomboid_data server_files mod_watcher_state sandbox_config
+sudo chown -R 1000:1000 zomboid_data server_files mod_watcher_state
 ```
 
-### 4. Launch the Server
+`mod_watcher_state` is easy to overlook because the watcher is a sidecar, but it
+is a bind mount into a non-root container exactly like the other two. Skip it and
+mod-watcher cannot record its baseline — see the troubleshooting entry below.
+
+`sandbox_config` is deliberately **not** chowned: it is mounted read-only, so
+the container never writes to it. It still has to be created by hand, because a
+directory Docker creates for you belongs to `root` and you would then need
+`sudo` just to drop a file into it. Leaving it empty is fine — see
+[Sandbox Settings](#sandbox-settings-pz_sandbox_source).
+
+### 5. Launch the Server
 
 ```bash
 docker compose up -d
@@ -77,6 +113,7 @@ docker logs -f zomboid
 | `PZ_JVM_EXTRA_ARGS` | Extra JVM args, space separated, appended to `vmArgs` | unset |
 | `PZ_SANDBOX_SOURCE` | Path **inside the container** to a sandbox `.cfg`/`.ini` or `SandboxVars.lua` to install. Unset disables the feature | unset |
 | `PZ_SANDBOX_FORCE` | `true` re-installs the sandbox file even if the source is unchanged | unset |
+| `CFG_RCONPort` | RCON port. Injected into the `.ini` **and** read by the health check | `27015` |
 | `HEALTH_FAIL_THRESHOLD` | Consecutive failed health checks before self-restart | `6` |
 | `SHUTDOWN_TIMEOUT` | Max seconds to wait for a save on shutdown. Keep below `stop_grace_period` | `150` |
 | `STALL_LIMIT` | Seconds of zero CPU **and** zero disk activity before declaring the server wedged | `30` |
@@ -97,6 +134,16 @@ Any variable prefixed with `CFG_` is stripped of the prefix and written into
 * `CFG_RCONPassword=...` — required for the RCON health check
 
 Full list: <https://pzwiki.net/wiki/Server_settings>
+
+**Known limit: a value cannot contain `|`.** `start.sh` updates an existing key
+with `sed "s|^$key=.*|$key=$val|"` and escapes only `&`, so a pipe in the value
+terminates the expression and corrupts the line. No stock Project Zomboid setting
+needs one; a mod option that does has to be written into the `.ini` by hand.
+
+**`CFG_`-prefixed names are injected verbatim**, minus the prefix. Do not name an
+unrelated variable `CFG_ANYTHING` in `.env` or compose expecting it to be ignored
+— it becomes an `.ini` key. This is why the join password is
+`SERVER_PASSWORD` rather than `CFG_PASSWORD`.
 
 ### Sandbox Settings (`PZ_SANDBOX_SOURCE`)
 
@@ -136,14 +183,14 @@ That last row is deliberate: a broken source means the server would silently run
 settings nobody chose, and for a brand-new world some of those are fixed at world
 generation.
 
-Create the directory yourself before the first `up` (`mkdir Build42/sandbox_config`):
-if Docker creates it for you it will be owned by `root`, and you will need `sudo`
-to put a file in it.
+Quick Start step 4 already creates this directory. Do not skip it and let Docker
+create it for you: that copy is owned by `root`, and you will need `sudo` to put a
+file in it.
 
 **To seed it**, either copy the running server's own file:
 
 ```bash
-cp Build42/zomboid_data/Server/MySurvivorServer_SandboxVars.lua Build42/sandbox_config/sandbox.lua
+cp zomboid_data/Server/MySurvivorServer_SandboxVars.lua sandbox_config/sandbox.lua
 ```
 
 or drop in a single-player preset from `Zomboid/Sandbox Presets/*.cfg`
@@ -170,12 +217,12 @@ docker logs zomboid | grep -A5 'Applying sandbox settings'
 
 ### Converting a preset by hand
 
-`Build42/pzConfigConverter.py` also runs on the host if you would rather do the
+`pzConfigConverter.py` also runs on the host if you would rather do the
 conversion yourself:
 
 ```bash
-python3 Build42/pzConfigConverter.py "map_sand.cfg" MySurvivorServer
-python3 Build42/pzConfigConverter.py --check MySurvivorServer_SandboxVars.lua
+python3 pzConfigConverter.py "map_sand.cfg" MySurvivorServer
+python3 pzConfigConverter.py --check MySurvivorServer_SandboxVars.lua
 ```
 
 It refuses to write a file it knows the server cannot use: a category split
@@ -222,13 +269,28 @@ docker logs zomboid | grep 'pzexe: vmArg'
 
 ## 🛠️ Adding Mods (Steam Workshop)
 
-Set both the Workshop IDs (for downloading) and the Mod IDs (for loading):
+Set both the Workshop IDs (for downloading) and the Mod IDs (for loading). These
+are **two separate edits in two places**, and neither block is a YAML list:
 
 ```yaml
-environment:
-  - CFG_WorkshopItems=2611652230;2611652231
-  - CFG_Mods=ModManager;AnotherModName
+# 1. Top of docker-compose.yml. The single source of truth for downloads:
+#    pz-server's CFG_WorkshopItems and mod-watcher's WORKSHOP_ITEMS are both
+#    *workshop_items, so editing here updates both and they cannot drift.
+x-workshop-items: &workshop_items "2611652230;2611652231"
 ```
+
+```yaml
+# 2. Under pz-server's environment:. The load order, separate from the download
+#    list because one Workshop item can ship several mods.
+    environment:
+      CFG_Mods: "ModManager;AnotherModName"
+```
+
+> **Do not edit `CFG_WorkshopItems` or `WORKSHOP_ITEMS` directly**, and do not
+> convert either `environment:` block to a `- KEY=value` list. Both keys are YAML
+> aliases of the anchor above, and an alias substitutes a whole node rather than a
+> fragment of a string — which only works if the block is a mapping.
+> Replacing an alias with a literal is exactly the drift the anchor prevents.
 
 Apply with `docker compose up -d` — no rebuild needed.
 
@@ -346,8 +408,8 @@ The build id lives beside the save rather than in `server_files` so that wiping
 and re-downloading the game cannot lose the history.
 
 ```bash
-cat Build42/zomboid_data/.pz_buildid
-ls -lh Build42/zomboid_data/backups/
+cat zomboid_data/.pz_buildid
+ls -lh zomboid_data/backups/
 ```
 
 ### Install validation
@@ -403,12 +465,20 @@ its only reach is outbound HTTPS to Steam and RCON to the game server.
 | Variable | Description | Default |
 | :--- | :--- | :--- |
 | `WORKSHOP_ITEMS` | Workshop IDs to watch. Aliased from `x-workshop-items`, shared with `CFG_WorkshopItems` | *(required)* |
+| `RCON_PASSWORD` | RCON password. Read with `os.environ[...]`, so an unset value is a hard startup failure, not a default | *(required)* |
+| `RCON_HOST` | Compose service name of the game server, on the internal network | `pz-server` |
+| `RCON_PORT` | Must match the server's `CFG_RCONPort` | `27015` |
+| `STATE_FILE` | Where the mod-timestamp baseline is written, inside the `./mod_watcher_state` mount | `/state/mod_watcher_state.json` |
 | `POLL_INTERVAL_SECONDS` | How often to check Steam for updates | `600` |
 | `MAX_RESTART_WAIT_SECONDS` | How long to wait for an empty server before forcing a restart | `3600` |
 | `EMPTY_CHECK_INTERVAL_SECONDS` | How often to re-check the player count while waiting | `60` |
 | `EMPTY_RESTART_GRACE_SECONDS` | Pause after the server empties, in case of a reconnect | `10` |
 | `FORCED_RESTART_WARNING_SECONDS` | Notice given before a forced (non-empty) restart | `300` |
-| `SHUTDOWN_TIMEOUT_SECONDS` | How long to wait for the RCON port to close before declaring failure | `300` |
+| `SHUTDOWN_TIMEOUT_SECONDS` | How long to wait for the RCON port to close before declaring failure | `120` |
+
+`docker-compose.yml` raises `SHUTDOWN_TIMEOUT_SECONDS` to `300`; the `120` above
+is the code default that applies if you drop the line. Every other default in this
+table is the code's, not compose's.
 
 If a restart can't be confirmed, the watcher leaves its saved timestamps
 untouched and retries on the next poll — so a transient failure self-heals
@@ -450,7 +520,7 @@ RCON broken in a specific way. `test_restart_logic.py` runs the real
 player counts, so every branch runs deterministically in seconds:
 
 ```bash
-docker compose run --rm --entrypoint python mod-watcher test_restart_logic.py
+docker compose run --rm --no-deps --entrypoint python mod-watcher test_restart_logic.py
 ```
 
 | Scenario | Expected |
@@ -462,6 +532,10 @@ docker compose run --rm --entrypoint python mod-watcher test_restart_logic.py
 
 The stub answers auth with two packets exactly as a real server does, so it also
 guards against a regression to the single-read handshake bug.
+
+`--no-deps` matters: mod-watcher `depends_on` pz-server, and without it
+`docker compose run` starts the game server too — a ~7GB SteamCMD
+download to run a test that finishes in seconds.
 
 To exercise the empty path against the *real* server instead, seed a stale
 timestamp and let the watcher poll immediately:
@@ -513,7 +587,8 @@ and non-zero paths parse differently. Two optional flags:
 | Flag | Purpose |
 | :--- | :--- |
 | `--test-bad-password` | Also confirm a wrong password is rejected. Off by default, since some RCON implementations throttle or ban on failed auth. |
-| `--skip-steam` | RCON checks only; no outbound network. |
+| `--skip-steam` | RCON checks only. Skips the Steam API check **and the state-file checks**, so it proves nothing about the mount permissions above. |
+| `--timeout N` | RCON socket timeout in seconds (default `10`). |
 
 ---
 
@@ -547,9 +622,18 @@ quoting mistakes that come with extracting it from `.env` on the host.
 ## 🧪 Testing Changes
 
 `docker-compose.test.yml` runs an isolated stack — separate world, separate
-ports, small heap, no mods — so you can test without touching the live save. It
-shares `./server_files` to avoid re-downloading 7GB, so **do not run it at the
-same time as the production stack**.
+ports, small heap, no mods, no watcher — so you can test without touching the
+live save. It shares `./server_files` to avoid re-downloading 7GB, so **do not run
+it at the same time as the production stack**.
+
+The overlay does not override `env_file`, so the test stack reads the same
+`Build42/.env` as production and will not start without it.
+
+`mod-watcher` is held back by `profiles: ["watcher"]`. Left enabled it would
+collide with the production container on `container_name`, inherit the full
+production Workshop list, and resolve `RCON_HOST: pz-server` to the **test**
+server — which it can `quit` over RCON in the middle of a test. Append
+`--profile watcher` to the `up` line below if you actually want to exercise it.
 
 ```bash
 docker compose -f docker-compose.yml -f docker-compose.test.yml -p zomboid-test up -d --build
@@ -578,6 +662,25 @@ docker compose down
 sudo chown -R 1000:1000 zomboid_data server_files
 docker compose up -d
 ```
+
+`mod-watcher` hits the same thing on `./mod_watcher_state`, and it is easier to
+miss because the game server keeps running normally. The symptom in
+`docker logs pz-mod-watcher` is a `PermissionError` on
+`/state/mod_watcher_state.json.tmp`, or — since the watcher now refuses to start
+rather than looping — a container stuck restarting with the owning uid printed.
+The fix is the same:
+```bash
+docker compose stop mod-watcher
+sudo mkdir -p mod_watcher_state
+sudo chown -R 1000:1000 mod_watcher_state
+docker compose up -d mod-watcher
+```
+
+> Before the pre-flight check existed this failed *silently*: `save_state()` threw
+> every cycle, the error was logged as "will retry next interval", and the
+> watcher went on polling forever without ever committing a baseline — so no mod
+> update was ever detected. If you are reading old logs, a repeating
+> "Baseline established for N mod(s)." line is that bug, not a healthy watcher.
 
 ### Container stuck "Restarting (127)" / "exec format error"
 `start.sh` has Windows CRLF line endings. The repo's `.gitattributes` forces LF
@@ -620,13 +723,17 @@ Build42/
 ├── start.sh                 # entrypoint: update, validate, back up, launch, shutdown
 ├── healthcheck.sh           # three-stage health check
 ├── pzConfigConverter.py     # sandbox .cfg/.ini -> SandboxVars.lua (also runs on the host)
-├── docker-compose.yml       # production stack (pz-server + mod-watcher)
+├── docker-compose.example.yml # tracked template -- copy to docker-compose.yml
+├── docker-compose.yml       # your live stack, copied from the example (gitignored)
 ├── docker-compose.test.yml  # isolated test overlay
 ├── sandbox_config/          # optional sandbox source, mounted read-only at
 │                            #   /config (gitignored; empty = game defaults)
 ├── mod_watcher/             # workshop update watcher (see below)
+│   ├── dockerfile           # python:3.12-slim, unprivileged, no Docker socket
+│   ├── requirements.txt     # requests, pinned
 │   ├── mod_watcher.py       # poll Steam, restart server when mods change
-│   └── probe.py             # read-only RCON/Steam/state diagnostic
+│   ├── probe.py             # read-only RCON/Steam/state diagnostic
+│   └── test_restart_logic.py # restart branches vs. a stub RCON server
 ├── mod_watcher_state/       # watcher's recorded mod timestamps
 ├── .env                     # secrets (gitignored)
 ├── .env.example             # template for .env
@@ -634,5 +741,5 @@ Build42/
 └── zomboid_data/            # worlds, configs, backups, .pz_buildid (gitignored)
 
 .gitattributes               # forces LF so Windows checkouts cannot break the scripts
-.gitignore                   # keeps secrets, the 7GB install and saves out of git
+.gitignore                   # keeps secrets, local compose, the install and saves out of git
 ```
